@@ -366,10 +366,10 @@ jobs:
           sleep 5
           cat service.log
 
-      - name: Install docker CLI
-        run: brew install docker
+      - name: Install docker and podman CLIs
+        run: brew install docker podman
 
-      - name: Create test Dockerfile and build context
+      - name: Create test Dockerfile
         run: |
           mkdir -p /tmp/testbuild
           cat > /tmp/testbuild/Dockerfile <<'EOF'
@@ -377,56 +377,32 @@ jobs:
           RUN echo "Built for $(uname -m)" > /arch.txt
           CMD ["sh", "-c", "cat /arch.txt"]
           EOF
-          # The Docker /build API requires a tar archive as the request body.
-          # We use curl to call it directly so that comma-separated --platform
-          # values are not validated/rejected by the docker CLI.
-          tar -C /tmp/testbuild -cf /tmp/context.tar Dockerfile
-
-      # ── Helper: call the socktainer /build API with a tar body ───────────────
-      # The legacy docker CLI only accepts a single os/arch for --platform.
-      # Calling the API via curl bypasses that client-side validation and lets
-      # socktainer handle the comma-separated platform string directly.
 
       # ── Rosetta path: arm64 + amd64 ──────────────────────────────────────────
-      - name: build – arm64+amd64 via API (Rosetta builder)
+      - name: docker buildx build – arm64+amd64 (Rosetta builder)
         run: |
-          echo "=== Building test-multiarch:rosetta for linux/arm64,linux/amd64 ==="
-          sudo curl -s --unix-socket /var/run/docker.sock \
-            -X POST \
-            -H "Content-Type: application/x-tar" \
-            --data-binary @/tmp/context.tar \
-            "http://localhost/build?platform=linux%2Farm64,linux%2Famd64&t=test-multiarch:rosetta" \
-            | tee /tmp/build-rosetta.log
-          grep -q '"errorDetail"' /tmp/build-rosetta.log \
-            && { echo "Build failed"; cat /tmp/build-rosetta.log; exit 1; } || true
+          sudo docker buildx build \
+            --platform=linux/arm64,linux/amd64 \
+            -t test-multiarch:rosetta \
+            /tmp/testbuild
           sudo docker image ls | grep 'test-multiarch'
 
       # ── QEMU path: s390x ─────────────────────────────────────────────────────
-      - name: build – s390x via API (QEMU builder)
+      - name: docker buildx build – s390x (QEMU builder)
         run: |
-          echo "=== Building test-multiarch:s390x for linux/s390x ==="
-          sudo curl -s --unix-socket /var/run/docker.sock \
-            -X POST \
-            -H "Content-Type: application/x-tar" \
-            --data-binary @/tmp/context.tar \
-            "http://localhost/build?platform=linux%2Fs390x&t=test-multiarch:s390x" \
-            | tee /tmp/build-s390x.log
-          grep -q '"errorDetail"' /tmp/build-s390x.log \
-            && { echo "Build failed"; cat /tmp/build-s390x.log; exit 1; } || true
+          sudo docker buildx build \
+            --platform=linux/s390x \
+            -t test-multiarch:s390x \
+            /tmp/testbuild
           sudo docker image ls | grep 'test-multiarch'
 
       # ── Combined manifest list: arm64 + amd64 + s390x ────────────────────────
-      - name: build – combined amd64+arm64+s390x manifest list via API
+      - name: docker buildx build – combined amd64+arm64+s390x manifest list
         run: |
-          echo "=== Building test-multiarch:latest for linux/arm64,linux/amd64,linux/s390x ==="
-          sudo curl -s --unix-socket /var/run/docker.sock \
-            -X POST \
-            -H "Content-Type: application/x-tar" \
-            --data-binary @/tmp/context.tar \
-            "http://localhost/build?platform=linux%2Farm64,linux%2Famd64,linux%2Fs390x&t=test-multiarch:latest" \
-            | tee /tmp/build-combined.log
-          grep -q '"errorDetail"' /tmp/build-combined.log \
-            && { echo "Build failed"; cat /tmp/build-combined.log; exit 1; } || true
+          sudo docker buildx build \
+            --platform=linux/arm64,linux/amd64,linux/s390x \
+            -t test-multiarch:latest \
+            /tmp/testbuild
           sudo docker image ls | grep 'test-multiarch'
 
       - name: Verify manifest list contains amd64, arm64, and s390x
@@ -440,19 +416,15 @@ jobs:
           [[ "$MANIFESTS" == *"s390x"* ]] || { echo "ERROR: s390x missing from manifest list"; exit 1; }
           echo "✓ Manifest list verified: amd64, arm64, and s390x all present"
 
-      # ── Podman-tagged build: same combined platforms via API ──────────────────
-      # Note: `podman build` uses buildah locally and does not proxy through
-      # DOCKER_HOST. We test the same API path with a podman-labelled tag to
-      # confirm socktainer handles the request regardless of the calling client.
-      - name: build – podman-tagged amd64+arm64+s390x manifest list via API
+      # ── podman build: manifest list amd64+ppc64le+arm64+s390x ────────────────
+      - name: podman build – manifest list amd64+ppc64le+arm64+s390x
         run: |
-          echo "=== Building test-multiarch:podman for linux/arm64,linux/amd64,linux/s390x ==="
-          sudo curl -s --unix-socket /var/run/docker.sock \
-            -X POST \
-            -H "Content-Type: application/x-tar" \
-            --data-binary @/tmp/context.tar \
-            "http://localhost/build?platform=linux%2Farm64,linux%2Famd64,linux%2Fs390x&t=test-multiarch:podman" \
-            | tee /tmp/build-podman.log
-          grep -q '"errorDetail"' /tmp/build-podman.log \
-            && { echo "Build failed"; cat /tmp/build-podman.log; exit 1; } || true
-          sudo docker image ls | grep 'test-multiarch'
+          platarch=linux/amd64,linux/ppc64le,linux/arm64,linux/s390x
+          sudo env DOCKER_HOST=unix:///var/run/docker.sock \
+            podman build \
+              --jobs=4 \
+              --platform="$platarch" \
+              --manifest shazam \
+              /tmp/testbuild
+          sudo env DOCKER_HOST=unix:///var/run/docker.sock \
+            podman manifest inspect shazam
