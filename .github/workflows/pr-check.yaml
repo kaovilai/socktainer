@@ -357,6 +357,17 @@ jobs:
           done
           tmate -S /tmp/tmate.sock kill-session
 
+      # container system start --enable-kernel-install runs the kernel download
+      # inside the tmate session. The loop above exits as soon as the API server
+      # responds (container system status = OK), which happens *before* the
+      # kernel download finishes.  Killing the tmate session at that point
+      # interrupts the download, leaving the kernel unconfigured.
+      # Running `container system kernel set --recommended` here (synchronously,
+      # not inside tmate) ensures the kernel is fully installed before we try to
+      # start the buildkit builder container.
+      - name: Install default Linux kernel for container builds
+        run: sudo container system kernel set --recommended
+
       - name: Start socktainer
         run: |
           SOCKTAINER_BIN="$(pwd)/socktainer"
