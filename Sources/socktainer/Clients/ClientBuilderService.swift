@@ -242,10 +242,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
         let imageDesc = ImageDescription(reference: builderImage, descriptor: image.descriptor)
 
         let imageConfig = try await image.config(for: builderPlatform).config
-        var builderArgs = ["--debug", "--vsock"]
-        if !useRosetta {
-            builderArgs.append("--enable-qemu")
-        }
+        var builderArgs = ["--debug", "--vsock"] + (useRosetta ? [] : ["--enable-qemu"])
         let processConfig = ProcessConfiguration(
             executable: "/usr/local/bin/container-builder-shim",
             arguments: builderArgs,

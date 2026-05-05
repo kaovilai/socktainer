@@ -106,7 +106,8 @@ extension BuildRoute {
             } catch {
                 throw Abort(
                     .badRequest,
-                    reason: "Invalid platform specification '\(platformString)': \(error.localizedDescription)"
+                    reason:
+                        "Invalid platform specification '\(platformString)': expected os/architecture or comma-separated list (e.g. linux/arm64,linux/amd64): \(error.localizedDescription)"
                 )
             }
 

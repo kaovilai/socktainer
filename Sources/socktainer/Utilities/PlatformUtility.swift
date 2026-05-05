@@ -46,7 +46,10 @@ public func parseMultiPlatformString(_ platformString: String) throws -> [Platfo
         do {
             return try Platform(from: part)
         } catch {
-            throw Abort(.badRequest, reason: "Unsupported platform '\(part)': \(error.localizedDescription)")
+            throw Abort(
+                .badRequest,
+                reason: "Unsupported platform '\(part)' (expected format: os/architecture, e.g. linux/arm64): \(error.localizedDescription)"
+            )
         }
     }
 }
