@@ -301,3 +301,125 @@ jobs:
           # prune all images end ensure no volumes are left
           sudo docker volume prune --all --force
           [[ "1" == $(sudo docker volume ls | wc -l | xargs) ]]
+
+  multi-arch-build:
+    name: multi-arch build test (amd64 + arm64 + s390x)
+    needs: build
+    runs-on: macos-26
+    timeout-minutes: 75
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # fetch the artifact from the build job
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: socktainer
+
+      - name: Prepare socktainer binary
+        run: |
+          ls -la
+          chmod 755 socktainer
+
+      - name: Fetch Apple Container installer
+        run: |
+          APPLE_CONTAINER_VERSION=$(grep 'let appleContainerVersion' Package.swift | sed -E 's/.*"([0-9.]+)".*/\1/')
+          wget "https://github.com/apple/container/releases/download/${APPLE_CONTAINER_VERSION}/container-installer-unsigned.pkg" \
+            -O container-installer-signed.pkg
+
+      - name: Install Apple Container
+        run: sudo installer -pkg container-installer-signed.pkg -target / -verbose
+
+      - name: Setup tmate
+        run: brew install tmate
+
+      - name: Start Apple Container system
+        run: |
+          tmate -S /tmp/tmate.sock new-session -d
+          tmate -S /tmp/tmate.sock wait tmate-ready
+          # skip welcome screen
+          tmate -F -S /tmp/tmate.sock send-keys "q" C-m
+
+          tmate -S /tmp/tmate.sock send-keys "sudo container system start --enable-kernel-install | tee /tmp/container.log" C-m
+
+          START=$SECONDS
+          TIMEOUT=60
+          while [ $((SECONDS - START)) -lt $TIMEOUT ]; do
+            tmate -S /tmp/tmate.sock capture-pane -p > /tmp/container.log
+            cat /tmp/container.log
+            if sudo container system status >/dev/null 2>&1; then
+              echo "Container system is ready."
+              break
+            else
+              echo "Container not ready yet..."
+            fi
+          done
+          tmate -S /tmp/tmate.sock kill-session
+
+      - name: Start socktainer
+        run: |
+          nohup sudo -i $PWD/socktainer > service.log 2>&1 &
+          echo $! > service.pid
+          sudo ln -s /var/root/.socktainer/container.sock /var/run/docker.sock
+          sleep 5
+          cat service.log
+
+      - name: Install docker and podman CLIs
+        run: brew install docker podman
+
+      - name: Create test Dockerfile
+        run: |
+          mkdir -p /tmp/testbuild
+          cat > /tmp/testbuild/Dockerfile <<'EOF'
+          FROM alpine:3
+          RUN echo "Built for $(uname -m)" > /arch.txt
+          CMD ["sh", "-c", "cat /arch.txt"]
+          EOF
+
+      # ── Rosetta path: arm64 + amd64 ──────────────────────────────────────────
+      - name: docker build – arm64+amd64 (Rosetta builder)
+        run: |
+          sudo docker build \
+            --platform linux/arm64,linux/amd64 \
+            -t test-multiarch:rosetta \
+            /tmp/testbuild
+          sudo docker image ls | grep 'test-multiarch'
+
+      # ── QEMU path: s390x ─────────────────────────────────────────────────────
+      - name: docker build – s390x (QEMU builder)
+        run: |
+          sudo docker build \
+            --platform linux/s390x \
+            -t test-multiarch:s390x \
+            /tmp/testbuild
+          sudo docker image ls | grep 'test-multiarch'
+
+      # ── Combined manifest list: arm64 + amd64 + s390x ────────────────────────
+      - name: docker build – combined amd64+arm64+s390x manifest list
+        run: |
+          sudo docker build \
+            --platform linux/arm64,linux/amd64,linux/s390x \
+            -t test-multiarch:latest \
+            /tmp/testbuild
+          sudo docker image ls | grep 'test-multiarch'
+
+      - name: Verify manifest list contains amd64, arm64, and s390x
+        run: |
+          MANIFESTS=$(curl --unix-socket /var/run/docker.sock \
+            "http://localhost/images/test-multiarch:latest/json?manifests=true" \
+            | jq -r '[.Manifests[]? | select(.Kind == "image") | .ImageData.Platform.architecture // empty] | unique | sort | join(",")')
+          echo "Platforms in manifest list: $MANIFESTS"
+          [[ "$MANIFESTS" == *"amd64"* ]] || { echo "ERROR: amd64 missing from manifest list"; exit 1; }
+          [[ "$MANIFESTS" == *"arm64"* ]] || { echo "ERROR: arm64 missing from manifest list"; exit 1; }
+          [[ "$MANIFESTS" == *"s390x"* ]] || { echo "ERROR: s390x missing from manifest list"; exit 1; }
+          echo "✓ Manifest list verified: amd64, arm64, and s390x all present"
+
+      # ── Podman CLI: combined amd64+arm64+s390x ───────────────────────────────
+      - name: podman build – combined amd64+arm64+s390x manifest list
+        run: |
+          sudo env DOCKER_HOST=unix:///var/run/docker.sock podman build \
+            --platform linux/arm64,linux/amd64,linux/s390x \
+            -t test-multiarch:podman \
+            /tmp/testbuild
+          sudo env DOCKER_HOST=unix:///var/run/docker.sock podman image ls | grep 'test-multiarch'
