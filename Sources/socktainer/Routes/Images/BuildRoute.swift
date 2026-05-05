@@ -90,13 +90,36 @@ extension BuildRoute {
             let noCache = query.nocache!
             let pull = query.pull.map { ["1", "true", "yes", "on"].contains($0.lowercased()) } ?? false
             let target = query.target!
-            let platform = query.platform!
+            let platformString = query.platform!
             let memory = query.memory ?? 2_048_000_000  // 2GB default
+
+            // Parse the platform parameter early so we can select the right builder mode
+            // before calling ensureReachable.  Supports comma-separated values, e.g.
+            //   --platform linux/arm64,linux/s390x
+            let parsedPlatforms: [Platform]
+            do {
+                if platformString.isEmpty {
+                    parsedPlatforms = [try Platform(from: "linux/\(Arch.hostArchitecture().rawValue)")]
+                } else {
+                    parsedPlatforms = try parseMultiPlatformString(platformString)
+                }
+            } catch {
+                throw Abort(
+                    .badRequest,
+                    reason: "Invalid platform specification '\(platformString)': \(error.localizedDescription)"
+                )
+            }
+
+            // Platforms that are neither arm64 nor amd64 require the QEMU-enabled builder
+            // (a separate container named "buildkit-qemu") so the builder VM can emulate
+            // foreign instruction sets via Linux binfmt_misc registration.
+            let needsQEMU = platformsRequireQEMU(parsedPlatforms)
 
             do {
                 try await builderClient.ensureReachable(
                     timeout: .seconds(3),
                     retryInterval: .milliseconds(250),
+                    qemu: needsQEMU,
                     logger: req.logger
                 )
             } catch {
@@ -220,7 +243,8 @@ extension BuildRoute {
                             noCache: noCache,
                             pull: pull,
                             target: target,
-                            platform: platform,
+                            platforms: parsedPlatforms,
+                            needsQEMU: needsQEMU,
                             memory: memory,
                             quiet: quiet,
                             builderClient: builderClient,
@@ -295,7 +319,8 @@ extension BuildRoute {
         noCache: Bool,
         pull: Bool,
         target: String,
-        platform: String,
+        platforms: [Platform],
+        needsQEMU: Bool,
         memory: Int,
         quiet: Bool,
         builderClient: ClientBuilderProtocol,
@@ -348,6 +373,7 @@ extension BuildRoute {
         let builder = try await builderClient.connect(
             timeout: timeout,
             retryInterval: .seconds(1),
+            qemu: needsQEMU,
             logger: logger
         )
         sendStreamMessage(" ---> Successfully connected to builder")
@@ -386,14 +412,6 @@ extension BuildRoute {
             return exp
         }
 
-        // Parse platforms
-        let platforms: Set<Platform> = {
-            guard platform.isEmpty else {
-                return [try! Platform(from: platform)]
-            }
-            return [try! Platform(from: "linux/\(Arch.hostArchitecture().rawValue)")]
-        }()
-
         // Build configuration
         let config = ContainerBuild.Builder.BuildConfig(
             buildID: buildID,
@@ -406,7 +424,7 @@ extension BuildRoute {
             dockerignore: nil,
             labels: labels,
             noCache: noCache,
-            platforms: [Platform](platforms),
+            platforms: platforms,
             terminal: nil,  // No terminal for API
             tags: [imageName],
             target: target,

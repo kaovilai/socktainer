@@ -38,10 +38,25 @@ struct BuilderCacheRecord: Sendable {
 }
 
 protocol ClientBuilderProtocol: Sendable {
-    func ensureReachable(timeout: Duration, retryInterval: Duration, logger: Logger) async throws
-    func connect(timeout: Duration, retryInterval: Duration, logger: Logger) async throws -> Builder
+    /// Verify the builder is reachable (starting it if necessary).
+    /// Pass `qemu: true` when the build requires platforms other than arm64/amd64
+    /// (e.g. s390x, ppc64le) so that a QEMU-enabled builder container is used.
+    func ensureReachable(timeout: Duration, retryInterval: Duration, qemu: Bool, logger: Logger) async throws
+    /// Connect to the builder, starting it if necessary.
+    /// Pass `qemu: true` when the build requires platforms other than arm64/amd64.
+    func connect(timeout: Duration, retryInterval: Duration, qemu: Bool, logger: Logger) async throws -> Builder
     func prune(_ request: BuilderPruneRequest, logger: Logger) async throws -> BuilderPruneResult
     func diskUsage(logger: Logger) async throws -> [BuilderCacheRecord]
+}
+
+extension ClientBuilderProtocol {
+    // Backward-compatible overloads that default to Rosetta mode (qemu: false).
+    func ensureReachable(timeout: Duration, retryInterval: Duration, logger: Logger) async throws {
+        try await ensureReachable(timeout: timeout, retryInterval: retryInterval, qemu: false, logger: logger)
+    }
+    func connect(timeout: Duration, retryInterval: Duration, logger: Logger) async throws -> Builder {
+        try await connect(timeout: timeout, retryInterval: retryInterval, qemu: false, logger: logger)
+    }
 }
 
 struct ClientBuilderService: ClientBuilderProtocol {
@@ -68,7 +83,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
     }
 
     func prune(_ request: BuilderPruneRequest, logger: Logger) async throws -> BuilderPruneResult {
-        let container = try await runningBuilderContainer(logger: logger)
+        let container = try await runningBuilderContainer(qemu: false, logger: logger)
 
         let command = try BuildctlUtility.pruneCommand(from: request)
         let stdoutText = try await execute(command: command, in: container, actionName: "buildctl prune", logger: logger)
@@ -81,7 +96,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
     }
 
     func diskUsage(logger: Logger) async throws -> [BuilderCacheRecord] {
-        let container = try await runningBuilderContainer(logger: logger)
+        let container = try await runningBuilderContainer(qemu: false, logger: logger)
         let command = BuildctlUtility.duCommand()
         let stdoutText = try await execute(command: command, in: container, actionName: "buildctl du", logger: logger)
 
@@ -104,8 +119,8 @@ struct ClientBuilderService: ClientBuilderProtocol {
         }
     }
 
-    func ensureReachable(timeout: Duration, retryInterval: Duration, logger: Logger) async throws {
-        _ = try await runningBuilderContainer(logger: logger)
+    func ensureReachable(timeout: Duration, retryInterval: Duration, qemu: Bool, logger: Logger) async throws {
+        _ = try await runningBuilderContainer(qemu: qemu, logger: logger)
 
         let clock = ContinuousClock()
         let deadline = clock.now + timeout
@@ -113,7 +128,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
 
         while clock.now < deadline {
             do {
-                let socket = try await dialBuilderSocket()
+                let socket = try await dialBuilderSocket(qemu: qemu)
                 try? socket.close()
                 return
             } catch {
@@ -130,8 +145,8 @@ struct ClientBuilderService: ClientBuilderProtocol {
         throw ContainerizationError(.timeout, message: "Timeout waiting for builder reachability")
     }
 
-    func connect(timeout: Duration, retryInterval: Duration, logger: Logger) async throws -> Builder {
-        _ = try await runningBuilderContainer(logger: logger)
+    func connect(timeout: Duration, retryInterval: Duration, qemu: Bool, logger: Logger) async throws -> Builder {
+        _ = try await runningBuilderContainer(qemu: qemu, logger: logger)
 
         let clock = ContinuousClock()
         let deadline = clock.now + timeout
@@ -139,7 +154,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
 
         while clock.now < deadline {
             do {
-                let socket = try await dialBuilderSocket()
+                let socket = try await dialBuilderSocket(qemu: qemu)
                 let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
                 let builder = try Builder(socket: socket, group: group, logger: logger)
                 do {
@@ -163,18 +178,19 @@ struct ClientBuilderService: ClientBuilderProtocol {
         throw ContainerizationError(.timeout, message: "Timeout waiting for connection to builder")
     }
 
-    private func dialBuilderSocket() async throws -> FileHandle {
-        let container = try await runningBuilderContainer(logger: nil)
+    private func dialBuilderSocket(qemu: Bool) async throws -> FileHandle {
+        let container = try await runningBuilderContainer(qemu: qemu, logger: nil)
         return try await containerClient.dial(id: container.id, port: builderPort)
     }
 
-    private func runningBuilderContainer(logger: Logger?) async throws -> ContainerSnapshot {
+    private func runningBuilderContainer(qemu: Bool, logger: Logger?) async throws -> ContainerSnapshot {
+        let containerID = resolvedContainerId(qemu: qemu)
         let container: ContainerSnapshot
         do {
-            container = try await containerClient.get(id: builderContainerId)
+            container = try await containerClient.get(id: containerID)
         } catch let error as ContainerizationError where error.code == .notFound {
             logger?.info("Builder container not found, creating a new builder instance")
-            return try await createAndStartBuilder(logger: logger)
+            return try await createAndStartBuilder(qemu: qemu, logger: logger)
         }
 
         guard container.status == .running else {
@@ -186,20 +202,28 @@ struct ClientBuilderService: ClientBuilderProtocol {
                 try await startBuildKit(containerId: container.id)
                 return try await containerClient.get(id: container.id)
             case .stopping:
-                throw ContainerizationError(.invalidState, message: "BuildKit container '\(builderContainerId)' is stopping")
+                throw ContainerizationError(.invalidState, message: "BuildKit container '\(containerID)' is stopping")
             case .unknown:
                 logger?.warning("Builder container has unknown state, recreating it")
                 try? await containerClient.delete(id: container.id)
-                return try await createAndStartBuilder(logger: logger)
+                return try await createAndStartBuilder(qemu: qemu, logger: logger)
             @unknown default:
-                throw ContainerizationError(.invalidState, message: "BuildKit container '\(builderContainerId)' is in an unsupported state")
+                throw ContainerizationError(.invalidState, message: "BuildKit container '\(containerID)' is in an unsupported state")
             }
         }
 
         return container
     }
 
-    private func createAndStartBuilder(logger: Logger?) async throws -> ContainerSnapshot {
+    /// Returns the container ID for a given mode.
+    /// QEMU-mode builder uses a distinct ID (base ID + "-qemu") so both builders can
+    /// coexist and be looked up independently.
+    private func resolvedContainerId(qemu: Bool) -> String {
+        qemu ? "\(builderContainerId)-qemu" : builderContainerId
+    }
+
+    private func createAndStartBuilder(qemu: Bool, logger: Logger?) async throws -> ContainerSnapshot {
+        let containerID = resolvedContainerId(qemu: qemu)
         let exportsMount = appSupportURL.appendingPathComponent("builder")
         if !FileManager.default.fileExists(atPath: exportsMount.path) {
             try FileManager.default.createDirectory(at: exportsMount, withIntermediateDirectories: true)
@@ -207,23 +231,31 @@ struct ClientBuilderService: ClientBuilderProtocol {
 
         let builderImage = DefaultsStore.get(key: .defaultBuilderImage)
         let builderPlatform = Platform(arch: "arm64", os: "linux", variant: "v8")
-        let useRosetta = DefaultsStore.getBool(key: .buildRosetta) ?? true
+        // QEMU mode: register binfmt handlers inside the VM kernel for all foreign
+        // architectures (s390x, ppc64le, riscv64, etc.).  Rosetta is disabled because
+        // it and QEMU binfmt registration are mutually exclusive in the builder shim.
+        // Rosetta mode (default): faster amd64 builds via Apple's Rosetta 2 translation.
+        let useRosetta = qemu ? false : (DefaultsStore.getBool(key: .buildRosetta) ?? true)
 
         let image = try await ClientImage.fetch(reference: builderImage, platform: builderPlatform)
         _ = try await image.getCreateSnapshot(platform: builderPlatform)
         let imageDesc = ImageDescription(reference: builderImage, descriptor: image.descriptor)
 
         let imageConfig = try await image.config(for: builderPlatform).config
+        var builderArgs = ["--debug", "--vsock"]
+        if !useRosetta {
+            builderArgs.append("--enable-qemu")
+        }
         let processConfig = ProcessConfiguration(
             executable: "/usr/local/bin/container-builder-shim",
-            arguments: ["--debug", "--vsock", useRosetta ? nil : "--enable-qemu"].compactMap { $0 },
+            arguments: builderArgs,
             environment: imageConfig?.env ?? [],
             workingDirectory: "/",
             terminal: false,
             user: .id(uid: 0, gid: 0)
         )
 
-        var config = ContainerConfiguration(id: builderContainerId, image: imageDesc, process: processConfig)
+        var config = ContainerConfiguration(id: containerID, image: imageDesc, process: processConfig)
         config.resources = try Parser.resources(cpus: builderCPUs, memory: builderMemory)
         config.labels = [ResourceLabelKeys.role: ResourceRoleValues.builder]
         config.mounts = [
@@ -240,15 +272,15 @@ struct ClientBuilderService: ClientBuilderProtocol {
         }
 
         config.networks = [
-            AttachmentConfiguration(network: defaultNetwork.id, options: AttachmentOptions(hostname: builderContainerId))
+            AttachmentConfiguration(network: defaultNetwork.id, options: AttachmentOptions(hostname: containerID))
         ]
         let nameserver = IPv4Address(networkStatus.ipv4Subnet.lower.value + 1).description
         config.dns = ContainerConfiguration.DNSConfiguration(nameservers: [nameserver], domain: nil, searchDomains: [], options: [])
 
         let kernel = try await ClientKernel.getDefaultKernel(for: .current)
         try await containerClient.create(configuration: config, options: .default, kernel: kernel)
-        try await startBuildKit(containerId: builderContainerId)
-        return try await containerClient.get(id: builderContainerId)
+        try await startBuildKit(containerId: containerID)
+        return try await containerClient.get(id: containerID)
     }
 
     private func startBuildKit(containerId: String) async throws {
