@@ -155,6 +155,23 @@ func configure(_ app: Application) async throws {
     try app.register(collection: SystemDFRoute(imageClient: imageClient, containerClient: containerClient, volumeClient: volumeClinet, builderClient: builderClient))
     try app.register(collection: VersionRoute())
 
+    // --- Podman libpod routes ---
+    try app.register(collection: LibpodPingRoute(client: healthCheckClient))
+    try app.register(collection: LibpodVersionRoute())
+    try app.register(collection: LibpodInfoRoute())
+    try app.register(collection: LibpodContainerListRoute(client: containerClient))
+    try app.register(collection: LibpodContainerCreateRoute(client: containerClient))
+    try app.register(collection: LibpodContainerStartRoute(client: containerClient))
+    try app.register(collection: LibpodContainerStopRoute(client: containerClient))
+    try app.register(collection: LibpodContainerKillRoute(client: containerClient))
+    try app.register(collection: LibpodContainerAttachRoute(client: containerClient))
+    try app.register(collection: LibpodContainerWaitRoute(client: containerClient))
+    try app.register(collection: LibpodContainerInspectRoute(client: containerClient))
+    try app.register(collection: LibpodContainerDeleteRoute(client: containerClient))
+    try app.register(collection: LibpodImageListRoute(client: imageClient))
+    try app.register(collection: LibpodImagePullRoute(client: imageClient))
+    try app.register(collection: LibpodImageDeleteRoute(client: imageClient))
+
     // Initialize broadcaster
     let broadcaster = EventBroadcaster()
     app.storage[EventBroadcasterKey.self] = broadcaster

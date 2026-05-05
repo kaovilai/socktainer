@@ -14,6 +14,8 @@
   - [Quick Start ⚡](#quick-start)
     - [Launch socktainer 🏁](#launch-socktainer-🏁)
     - [Using Docker CLI 🐳](#using-docker-cli-🐳)
+    - [Using Podman CLI 🦭](#using-podman-cli-🦭)
+    - [Socket Symlinks 🔗](#socket-symlinks-🔗)
   - [Key Features ✨](#key-features)
   - [Requirements 📋](#requirements-📋)
   - [Installation 🛠️](#installation-🛠️)
@@ -72,6 +74,59 @@ Or inline without exporting:
 ```bash
 DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker ps
 DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
+```
+
+### Using Podman CLI 🦭
+
+Podman connects to socktainer via `CONTAINER_HOST` or socket symlink:
+
+```bash
+export CONTAINER_HOST=unix://$HOME/.socktainer/container.sock
+podman version   # Check connection
+podman ps        # List running containers
+podman images    # List available images
+```
+
+> [!NOTE]
+> Podman uses its own API endpoints (`/libpod/*`), not Docker-compatible ones.
+> Socktainer implements a subset of the libpod API — see [#201](https://github.com/socktainer/socktainer/issues/201) for progress.
+
+### Socket Symlinks 🔗
+
+Instead of setting environment variables, you can symlink socktainer's socket to the default locations that Docker and Podman expect:
+
+**Docker** (requires `sudo`):
+
+```bash
+sudo ln -sf "$HOME/.socktainer/container.sock" /var/run/docker.sock
+```
+
+**Podman** (no `sudo` needed):
+
+```bash
+# Podman looks for its socket at $TMPDIR/storage-run-$UID/podman/podman.sock
+PODMAN_SOCK_DIR="${TMPDIR%/}/storage-run-$(id -u)/podman"
+mkdir -p "$PODMAN_SOCK_DIR"
+ln -sf "$HOME/.socktainer/container.sock" "$PODMAN_SOCK_DIR/podman.sock"
+```
+
+**Both at once:**
+
+```bash
+# Docker
+sudo ln -sf "$HOME/.socktainer/container.sock" /var/run/docker.sock
+
+# Podman
+PODMAN_SOCK_DIR="${TMPDIR%/}/storage-run-$(id -u)/podman"
+mkdir -p "$PODMAN_SOCK_DIR"
+ln -sf "$HOME/.socktainer/container.sock" "$PODMAN_SOCK_DIR/podman.sock"
+```
+
+To undo:
+
+```bash
+sudo rm -f /var/run/docker.sock                                          # Docker
+rm -f "${TMPDIR%/}/storage-run-$(id -u)/podman/podman.sock"              # Podman
 ```
 
 ---

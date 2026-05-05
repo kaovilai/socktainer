@@ -103,7 +103,7 @@ final class RegexRouter: @unchecked Sendable {
         // Add optional version prefix: /v1.47/images/... or /images/...
         // Group 1: version (e.g., "1.47")
         // Group 2+: original parameters
-        regexPattern = "^(?:/v([0-9]+\\.[0-9]+))?" + regexPattern + "$"
+        regexPattern = "^(?:/v([0-9]+\\.[0-9]+(?:\\.[0-9]+)?))?" + regexPattern + "$"
 
         return (regexPattern, parameterNames)
     }
