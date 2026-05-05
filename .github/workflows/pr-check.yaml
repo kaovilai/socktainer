@@ -366,8 +366,15 @@ jobs:
           sleep 5
           cat service.log
 
-      - name: Install docker and podman CLIs
-        run: brew install docker podman
+      - name: Install docker, docker-buildx, and podman CLIs
+        run: |
+          brew install docker docker-buildx podman
+          # docker-buildx is installed as a CLI plugin by Homebrew under
+          # /opt/homebrew/lib/docker/cli-plugins/docker-buildx.
+          # Make it visible to sudo (which may search a different prefix).
+          sudo mkdir -p /usr/local/lib/docker/cli-plugins
+          sudo ln -sf "$(brew --prefix)/lib/docker/cli-plugins/docker-buildx" \
+            /usr/local/lib/docker/cli-plugins/docker-buildx
 
       - name: Create test Dockerfile
         run: |
