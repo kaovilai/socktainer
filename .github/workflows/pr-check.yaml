@@ -359,7 +359,8 @@ jobs:
 
       - name: Start socktainer
         run: |
-          nohup sudo -i $PWD/socktainer > service.log 2>&1 &
+          SOCKTAINER_BIN="$(pwd)/socktainer"
+          nohup sudo -i "$SOCKTAINER_BIN" > service.log 2>&1 &
           echo $! > service.pid
           sudo ln -s /var/root/.socktainer/container.sock /var/run/docker.sock
           sleep 5
