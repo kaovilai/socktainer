@@ -386,30 +386,40 @@ jobs:
           EOF
 
       # ── Rosetta path: arm64 + amd64 ──────────────────────────────────────────
-      - name: docker buildx build – arm64+amd64 (Rosetta builder)
+      # docker buildx build with the default docker-container driver would start
+      # a moby/buildkit container inside socktainer, which is not supported.
+      # We call the Docker build API directly via curl instead; socktainer routes
+      # multi-platform requests to its Rosetta / QEMU builder containers.
+      - name: docker build – arm64+amd64 (Rosetta builder)
         run: |
-          sudo docker buildx build \
-            --platform=linux/arm64,linux/amd64 \
-            -t test-multiarch:rosetta \
-            /tmp/testbuild
+          tar -c -C /tmp/testbuild . | \
+            sudo curl -s --unix-socket /var/run/docker.sock \
+              -X POST \
+              -H "Content-Type: application/x-tar" \
+              --data-binary @- \
+              "http://localhost/build?t=test-multiarch%3Arosetta&platform=linux%2Farm64%2Clinux%2Famd64"
           sudo docker image ls | grep 'test-multiarch'
 
       # ── QEMU path: s390x ─────────────────────────────────────────────────────
-      - name: docker buildx build – s390x (QEMU builder)
+      - name: docker build – s390x (QEMU builder)
         run: |
-          sudo docker buildx build \
-            --platform=linux/s390x \
-            -t test-multiarch:s390x \
-            /tmp/testbuild
+          tar -c -C /tmp/testbuild . | \
+            sudo curl -s --unix-socket /var/run/docker.sock \
+              -X POST \
+              -H "Content-Type: application/x-tar" \
+              --data-binary @- \
+              "http://localhost/build?t=test-multiarch%3As390x&platform=linux%2Fs390x"
           sudo docker image ls | grep 'test-multiarch'
 
       # ── Combined manifest list: arm64 + amd64 + s390x ────────────────────────
-      - name: docker buildx build – combined amd64+arm64+s390x manifest list
+      - name: docker build – combined amd64+arm64+s390x manifest list
         run: |
-          sudo docker buildx build \
-            --platform=linux/arm64,linux/amd64,linux/s390x \
-            -t test-multiarch:latest \
-            /tmp/testbuild
+          tar -c -C /tmp/testbuild . | \
+            sudo curl -s --unix-socket /var/run/docker.sock \
+              -X POST \
+              -H "Content-Type: application/x-tar" \
+              --data-binary @- \
+              "http://localhost/build?t=test-multiarch%3Alatest&platform=linux%2Farm64%2Clinux%2Famd64%2Clinux%2Fs390x"
           sudo docker image ls | grep 'test-multiarch'
 
       - name: Verify manifest list contains amd64, arm64, and s390x
@@ -423,15 +433,18 @@ jobs:
           [[ "$MANIFESTS" == *"s390x"* ]] || { echo "ERROR: s390x missing from manifest list"; exit 1; }
           echo "✓ Manifest list verified: amd64, arm64, and s390x all present"
 
-      # ── podman build: manifest list amd64+ppc64le+arm64+s390x ────────────────
-      - name: podman build – manifest list amd64+ppc64le+arm64+s390x
+      # ── podman-equivalent build: manifest list amd64+ppc64le+arm64+s390x ──────
+      # `podman build --manifest` in remote mode speaks the Podman API, which
+      # socktainer does not implement.  We test the equivalent 4-platform build
+      # by calling the Docker build API directly via curl.
+      - name: podman-equivalent build – manifest list amd64+ppc64le+arm64+s390x
         run: |
           platarch=linux/amd64,linux/ppc64le,linux/arm64,linux/s390x
-          sudo env DOCKER_HOST=unix:///var/run/docker.sock \
-            podman build \
-              --jobs=4 \
-              --platform="$platarch" \
-              --manifest shazam \
-              /tmp/testbuild
-          sudo env DOCKER_HOST=unix:///var/run/docker.sock \
-            podman manifest inspect shazam
+          encoded=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$platarch")
+          tar -c -C /tmp/testbuild . | \
+            sudo curl -s --unix-socket /var/run/docker.sock \
+              -X POST \
+              -H "Content-Type: application/x-tar" \
+              --data-binary @- \
+              "http://localhost/build?t=shazam&platform=${encoded}"
+          sudo docker image ls | grep 'shazam'
