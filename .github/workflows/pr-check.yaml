@@ -301,3 +301,37 @@ jobs:
           # prune all images end ensure no volumes are left
           sudo docker volume prune --all --force
           [[ "1" == $(sudo docker volume ls | wc -l | xargs) ]]
+
+      # --- Podman CLI integration tests ---
+      - name: install podman cli
+        run: |
+          brew install podman
+
+      - name: setup podman socket
+        run: |
+          PODMAN_SOCK_DIR="${TMPDIR%/}/storage-run-$(id -u)/podman"
+          sudo mkdir -p "$PODMAN_SOCK_DIR"
+          sudo ln -sf /var/root/.socktainer/container.sock "$PODMAN_SOCK_DIR/podman.sock"
+
+      - name: check podman version with socktainer
+        run: |
+          sudo podman version
+          sudo podman version | grep 'socktainer'
+
+      - name: check podman images with socktainer
+        run: |
+          sudo podman image ls
+          sudo podman pull alpine:latest
+          sudo podman image ls | grep alpine
+
+      - name: check podman containers with socktainer
+        run: |
+          sudo podman ps
+          sudo podman ps -a
+
+      - name: check podman build with socktainer
+        run: |
+          echo 'FROM alpine:latest' > /tmp/Dockerfile.test
+          echo 'RUN echo hello' >> /tmp/Dockerfile.test
+          sudo podman build -t test-build -f /tmp/Dockerfile.test /tmp
+          sudo podman image ls | grep test-build

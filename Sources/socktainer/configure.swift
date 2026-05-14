@@ -171,6 +171,28 @@ func configure(_ app: Application) async throws {
     try app.register(collection: LibpodImageListRoute(client: imageClient))
     try app.register(collection: LibpodImagePullRoute(client: imageClient))
     try app.register(collection: LibpodImageDeleteRoute(client: imageClient))
+    try app.register(collection: LibpodImageInspectRoute(client: imageClient))
+    try app.register(collection: LibpodImageTagRoute())
+    try app.register(collection: LibpodBuildRoute(client: containerClient, builderClient: builderClient))
+    try app.register(collection: LibpodContainerLogsRoute(client: containerClient))
+    try app.register(collection: LibpodContainerTopRoute())
+    try app.register(collection: LibpodContainerRenameRoute())
+    try app.register(collection: LibpodContainerRestartRoute(client: containerClient))
+    try app.register(collection: LibpodExecCreateRoute(client: containerClient))
+    try app.register(collection: LibpodExecStartRoute(client: containerClient))
+    try app.register(collection: LibpodExecInspectRoute(client: containerClient))
+    try app.register(collection: LibpodVolumeListRoute(dockerRoute: VolumeListRoute(client: volumeClinet)))
+    try app.register(collection: LibpodVolumeCreateRoute(dockerRoute: VolumeCreateRoute(client: volumeClinet)))
+    try app.register(collection: LibpodVolumeDeleteRoute(dockerRoute: VolumeDeleteRoute(client: volumeClinet)))
+    try app.register(collection: LibpodVolumeInspectRoute(dockerRoute: VolumeInspectRoute(client: volumeClinet)))
+    try app.register(collection: LibpodNetworkListRoute())
+    try app.register(collection: LibpodNetworkCreateRoute(dockerRoute: NetworkCreateRoute(client: networkClient)))
+    try app.register(collection: LibpodNetworkDeleteRoute(dockerRoute: NetworkDeletetRoute(client: networkClient)))
+    try app.register(collection: LibpodNetworkInspectRoute(client: networkClient))
+    try app.register(
+        collection: LibpodSystemDFRoute(
+            dockerRoute: SystemDFRoute(imageClient: imageClient, containerClient: containerClient, volumeClient: volumeClinet, builderClient: builderClient)))
+    try app.register(collection: LibpodAuthRoute(client: registryClient))
 
     // Initialize broadcaster
     let broadcaster = EventBroadcaster()
