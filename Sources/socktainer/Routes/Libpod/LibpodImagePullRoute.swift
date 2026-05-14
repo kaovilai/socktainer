@@ -55,7 +55,7 @@ struct LibpodImagePullRoute: RouteCollection {
     private static func parseReference(_ reference: String) -> (image: String, tag: String) {
         let decoded = reference.removingPercentEncoding ?? reference
         if let atIndex = decoded.lastIndex(of: ":"),
-           !decoded[atIndex...].contains("/")
+            !decoded[atIndex...].contains("/")
         {
             let image = String(decoded[..<atIndex])
             let tag = String(decoded[decoded.index(after: atIndex)...])
