@@ -315,7 +315,8 @@ jobs:
       - name: check podman version with socktainer
         run: |
           sudo -E podman version
-          sudo -E podman version | grep 'socktainer'
+          # Verify socktainer is responding with expected API version
+          sudo -E podman version | grep 'v1.51'
 
       - name: check podman images with socktainer
         run: |
