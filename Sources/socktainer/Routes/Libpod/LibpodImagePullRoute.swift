@@ -38,9 +38,11 @@ struct LibpodImagePullRoute: RouteCollection {
                 Task {
                     do {
                         for try await progress in progressStream {
-                            let json = "{\"status\": \"\(progress.replacingOccurrences(of: "\"", with: "\\\""))\"}"
-                            _ = writer.write(.buffer(ByteBuffer(string: json + "\n")))
+                            let escaped = progress.replacingOccurrences(of: "\"", with: "\\\"")
+                            _ = writer.write(.buffer(ByteBuffer(string: "{\"stream\": \"\(escaped)\\n\"}\n")))
                         }
+                        let imageRef = tag.isEmpty ? image : "\(image):\(tag)"
+                        _ = writer.write(.buffer(ByteBuffer(string: "{\"images\": [\"\(imageRef)\"], \"id\": \"\(imageRef)\"}\n")))
                         _ = writer.write(.end)
                     } catch {
                         _ = writer.write(.buffer(ByteBuffer(string: "{\"error\": \"\(error.localizedDescription)\"}\n")))
