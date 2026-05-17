@@ -309,9 +309,9 @@ jobs:
 
       - name: setup podman socket
         run: |
-          PODMAN_SOCK_DIR="${TMPDIR%/}/storage-run-$(id -u)/podman"
-          sudo mkdir -p "$PODMAN_SOCK_DIR"
-          sudo ln -sf /var/root/.socktainer/container.sock "$PODMAN_SOCK_DIR/podman.sock"
+          # Podman on macOS as root looks for /run/podman/podman.sock
+          sudo mkdir -p /run/podman
+          sudo ln -sf /var/root/.socktainer/container.sock /run/podman/podman.sock
 
       - name: check podman version with socktainer
         run: |
