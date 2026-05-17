@@ -309,29 +309,28 @@ jobs:
 
       - name: setup podman socket
         run: |
-          # Podman on macOS as root looks for /run/podman/podman.sock
-          sudo mkdir -p /run/podman
-          sudo ln -sf /var/root/.socktainer/container.sock /run/podman/podman.sock
+          # /run is read-only on macOS, so use CONTAINER_HOST env var
+          echo "CONTAINER_HOST=unix:///var/root/.socktainer/container.sock" >> "$GITHUB_ENV"
 
       - name: check podman version with socktainer
         run: |
-          sudo podman version
-          sudo podman version | grep 'socktainer'
+          sudo -E podman version
+          sudo -E podman version | grep 'socktainer'
 
       - name: check podman images with socktainer
         run: |
-          sudo podman image ls
-          sudo podman pull alpine:latest
-          sudo podman image ls | grep alpine
+          sudo -E podman image ls
+          sudo -E podman pull alpine:latest
+          sudo -E podman image ls | grep alpine
 
       - name: check podman containers with socktainer
         run: |
-          sudo podman ps
-          sudo podman ps -a
+          sudo -E podman ps
+          sudo -E podman ps -a
 
       - name: check podman build with socktainer
         run: |
           echo 'FROM alpine:latest' > /tmp/Dockerfile.test
           echo 'RUN echo hello' >> /tmp/Dockerfile.test
-          sudo podman build -t test-build -f /tmp/Dockerfile.test /tmp
-          sudo podman image ls | grep test-build
+          sudo -E podman build -t test-build -f /tmp/Dockerfile.test /tmp
+          sudo -E podman image ls | grep test-build
