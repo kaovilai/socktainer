@@ -191,7 +191,7 @@ jobs:
 
       - name: start BuildKit builder
         run: |
-          sudo container system kernel set --recommended
+          sudo container system kernel set --recommended --force
           sudo container builder start
 
       - name: run socktainer
