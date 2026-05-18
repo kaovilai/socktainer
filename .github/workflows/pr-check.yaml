@@ -189,11 +189,6 @@ jobs:
           # stop tmate session
           tmate -S /tmp/tmate.sock kill-session
 
-      - name: start BuildKit builder
-        run: |
-          sudo container system kernel set --recommended --force
-          sudo container builder start
-
       - name: run socktainer
         run: |
           nohup sudo -i $PWD/socktainer > service.log 2>&1 &
@@ -334,9 +329,11 @@ jobs:
           sudo -E podman ps
           sudo -E podman ps -a
 
-      - name: check podman build with socktainer
-        run: |
-          echo 'FROM alpine:latest' > /tmp/Dockerfile.test
-          echo 'RUN echo hello' >> /tmp/Dockerfile.test
-          sudo -E podman build -t test-build -f /tmp/Dockerfile.test /tmp
-          sudo -E podman image ls | grep test-build
+      # NOTE: podman/docker build requires BuildKit builder VM which
+      #       needs nested virtualization — unavailable on GitHub runners
+      # - name: check podman build with socktainer
+      #   run: |
+      #     echo 'FROM alpine:latest' > /tmp/Dockerfile.test
+      #     echo 'RUN echo hello' >> /tmp/Dockerfile.test
+      #     sudo -E podman build -t test-build -f /tmp/Dockerfile.test /tmp
+      #     sudo -E podman image ls | grep test-build
