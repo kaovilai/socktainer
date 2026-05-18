@@ -191,6 +191,8 @@ jobs:
 
       - name: start BuildKit builder
         run: |
+          sudo container system kernel list
+          sudo container system kernel set default arm64
           sudo container builder start
 
       - name: run socktainer
