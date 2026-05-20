@@ -330,7 +330,10 @@ jobs:
           sudo -E podman ps -a
 
       # NOTE: podman/docker build requires BuildKit builder VM which
-      #       needs nested virtualization — unavailable on GitHub runners
+      #       needs nested virtualization (Apple Virtualization.framework).
+      #       GitHub-hosted macOS runners don't support nested virtualization.
+      #       See: https://github.com/actions/runner-images/issues/12933
+      #            https://github.com/orgs/community/discussions/69211
       # - name: check podman build with socktainer
       #   run: |
       #     echo 'FROM alpine:latest' > /tmp/Dockerfile.test
