@@ -53,6 +53,17 @@ try LoggingSystem.bootstrap(from: &env)
 // Create and configure the Vapor application
 let app = try await Application.make(env)
 let homeDirectory = ProcessInfo.processInfo.environment["HOME"]
+
+// Held for the process lifetime: refuses to start a second daemon against the same
+// socket instead of silently stealing it out from under a still-running instance.
+let instanceLock: SingleInstanceLock
+do {
+    instanceLock = try acquireSingleInstanceLock(homeDirectory: homeDirectory)
+} catch let error as SingleInstanceError {
+    FileHandle.standardError.write(Data("socktainer: \(error)\n".utf8))
+    exit(1)
+}
+
 try prepareUnixSocket(for: app, homeDirectory: homeDirectory)
 if options.dockerContext,
     let homeDir = homeDirectory,
@@ -72,3 +83,4 @@ do {
     throw error
 }
 try await app.running?.onStop.get()
+withExtendedLifetime(instanceLock) {}
