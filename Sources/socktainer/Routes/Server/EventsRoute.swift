@@ -11,12 +11,23 @@ struct EventsRoute: RouteCollection {
 }
 
 extension EventsRoute {
+    /// `since`/`until` as Docker clients send them: Unix seconds (possibly fractional) or RFC3339.
+    static func parseTimestamp(_ value: String?) -> Date? {
+        guard let value, !value.isEmpty else { return nil }
+        if let seconds = Double(value) { return Date(timeIntervalSince1970: seconds) }
+        return ISO8601DateFormatter().date(from: value)
+    }
+
     static func handler(client: ClientHealthCheckProtocol) -> @Sendable (Request) async throws -> Response {
         { req in
 
             guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else {
                 throw Abort(.internalServerError, reason: "EventBroadcaster not configured")
             }
+            // There is no event history to replay, so `since` only drops events older than it, and
+            // `until` ends the stream at that time (immediately when it has already passed).
+            let since = parseTimestamp(req.query["since"] as String?)
+            let until = parseTimestamp(req.query["until"] as String?)
             let stream = await broadcaster.stream()
 
             let response = Response(status: .ok)
@@ -39,23 +50,39 @@ extension EventsRoute {
                     _ = try? await writer.write(.end)
                     return
                 }
-                for await event in stream {
-                    if let json = try? JSONEncoder().encode(event) {
-                        var buffer = req.application.allocator.buffer(capacity: json.count + 1)
-                        buffer.writeBytes(json)
-                        buffer.writeString("\n")
-                        do {
-                            try await writer.write(.buffer(buffer))
-                        } catch is IOError {
-                            req.logger.debug("Client disconnected (broken pipe)")
-                            break
-                        } catch let error as ChannelError where error == .ioOnClosedChannel {
-                            req.logger.debug("Client disconnected (closed channel)")
-                            break
-                        } catch {
-                            req.logger.warning("\(event) raised '\(error)'")
+                // The stream's iteration ends when its task is cancelled, so racing it against a sleep
+                // until `until` is what ends it at that time even when no event arrives.
+                await withTaskGroup(of: Void.self) { group in
+                    if let until {
+                        group.addTask {
+                            let remaining = until.timeIntervalSinceNow
+                            if remaining > 0 { try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000)) }
                         }
                     }
+                    group.addTask {
+                        for await event in stream {
+                            if let since, Double(event.time) < since.timeIntervalSince1970.rounded(.down) { continue }
+                            if let json = try? JSONEncoder().encode(event) {
+                                var buffer = req.application.allocator.buffer(capacity: json.count + 1)
+                                buffer.writeBytes(json)
+                                buffer.writeString("\n")
+                                do {
+                                    try await writer.write(.buffer(buffer))
+                                } catch is IOError {
+                                    req.logger.debug("Client disconnected (broken pipe)")
+                                    break
+                                } catch let error as ChannelError where error == .ioOnClosedChannel {
+                                    req.logger.debug("Client disconnected (closed channel)")
+                                    break
+                                } catch {
+                                    req.logger.warning("\(event) raised '\(error)'")
+                                }
+                            }
+                        }
+                    }
+                    // Whichever finishes first (the deadline, or the stream ending) stops the other.
+                    await group.next()
+                    group.cancelAll()
                 }
                 _ = try? await writer.write(.end)
             })
