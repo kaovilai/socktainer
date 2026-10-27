@@ -62,6 +62,15 @@ Limits that Docker-compat shares (libpod mirrors Docker-compat's support, it doe
   content when its host directory is empty at create time (not with `nocopy`); ownership stays the
   host user's. Directory-backed default volumes are not viable: virtiofs ignores `chown` and rejects
   `chmod` on the share root.
+- `podman logs --since/--until`: Docker-compat's logs route ignores both.
+- `podman stop`/`restart` without `--time` waits 5 seconds (podman and Docker default to 10).
+- Container inspect `Image` carries the image reference, not the image ID.
+- `container prune --filter label!=x` is rejected with 400 (the Docker-compat prune has no negative
+  label filter).
+- `network rm -f` and `volume rm -f` do not remove the containers using them; Docker-compat's force
+  has no such cleanup.
+- `podman update --env/--unset-env` and `podman volume create --uid/--gid` are refused (400): the
+  backend has no way to apply them.
 - `podman cp` out of a container to a host path under `/tmp` fails inside the podman client on macOS
   (`/tmp` is a symlink to `/private/tmp`); copying to a real directory works.
 
@@ -124,7 +133,7 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 | `podman load` | POST `/libpod/local/images/load` (confirmed in podman source — note: NOT `/libpod/images/load`) | ✅ |
 | `podman untag` | POST `/libpod/images/{name}/untag` | ✅ |
 | `podman image diff` | GET `/libpod/images/{name}/changes`; the CLI calls `/libpod/containers/{name}/changes?difftype=image` | ✅ (top layer against the layers below it: whiteout = D, path present below = C, else A; with `parent`, both images' full filesystems are compared) |
-| `podman import` | POST `/libpod/images/import` (confirmed in podman source: query params are `reference`/`message`/`changes`/`url`, not Docker's `repo`/`tag`/`fromSrc`) | ✅ (translates libpod's `reference` query param into Docker's `repo`/`tag`/`fromSrc=-` shape, then delegates; `url`-based remote import still rejected, same limitation as the Docker-side route) |
+| `podman import` | POST `/libpod/images/import` (confirmed in podman source: query params are `reference`/`message`/`changes`/`url`, not Docker's `repo`/`tag`/`fromSrc`) | ✅ (decodes `reference` and calls the image client's import directly, answering with podman's single `{"Id": <digest>}` object instead of Docker's progress stream; `url`-based remote import still rejected, same limitation as the Docker-side route) |
 
 ## Volumes
 
@@ -200,7 +209,7 @@ back-to-back to narrow, not close, the window.
 |---|---|---|
 | `podman manifest create` | POST `/libpod/manifests/{name}` | ✅ |
 | `podman manifest inspect` | GET `/libpod/manifests/{name}/json` | ✅ |
-| `podman manifest exists` | GET `/libpod/manifests/{name}/exists` | ✅ |
+| `podman manifest exists` | GET `/libpod/manifests/{name}/exists` | ✅ (only lists made by `manifest create`/`add` or `build --manifest` count; an ordinary image is not a manifest list, as in podman) |
 | `podman manifest add` | PUT `/libpod/manifests/{name}` (`operation: "update"`) | ✅ |
 | `podman manifest remove` | PUT `/libpod/manifests/{name}` (`operation: "remove"`) | ✅ |
 | `podman manifest rm` | DELETE `/libpod/manifests/{name}` | ✅ |
