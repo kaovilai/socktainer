@@ -197,7 +197,7 @@ extension ContainerInspectRoute {
             let containerState: ContainerState = ContainerState(
                 Status: isPendingRestart ? "restarting" : container.mobyState,
                 Running: container.status == .running,
-                Paused: false,  // Apple containers don't have a paused state like Docker
+                Paused: ContainerPauseState.shared.isPaused(container),
                 Restarting: isPendingRestart,
                 OOMKilled: false,
                 Dead: container.status == .stopped && !isPendingRestart && !container.isNeverStarted,

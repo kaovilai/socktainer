@@ -29,6 +29,9 @@ extension ContainerSnapshot {
     /// only the latter has a start date. Docker calls the former `created`.
     var isNeverStarted: Bool { status == .stopped && startedDate == nil }
 
-    /// Docker's state for this container (`created` / `running` / `exited`).
-    var mobyState: String { isNeverStarted ? "created" : status.mobyState }
+    /// Docker's state for this container (`created` / `running` / `paused` / `exited`).
+    var mobyState: String {
+        if isNeverStarted { return "created" }
+        return ContainerPauseState.shared.isPaused(self) ? "paused" : status.mobyState
+    }
 }

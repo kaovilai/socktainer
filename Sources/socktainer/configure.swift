@@ -46,6 +46,7 @@ func configure(_ app: Application) async throws {
     let archiveClient = ClientArchiveService(appSupportPath: appleContainerAppSupportUrl)
     let builderClient = ClientBuilderService(appSupportURL: appleContainerAppSupportUrl, containerSystemConfig: systemConfig)
     let commandRunner = ClientContainerCommandRunnerService()
+    let pauser = ContainerPauseService(runner: commandRunner)
 
     // Create and install regex routing middleware with logging
     let regexRouter = app.regexRouter(with: app.logger)
@@ -76,7 +77,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ContainerKillRoute(client: containerClient))
     try app.register(collection: ContainerListRoute(client: containerClient))
     try app.register(collection: ContainerLogsRoute(client: containerClient))
-    try app.register(collection: ContainerPauseRoute())
+    try app.register(collection: ContainerPauseRoute(client: containerClient, pauser: pauser))
     try app.register(collection: ContainerPruneRoute(client: containerClient))
     try app.register(collection: ContainerRenameRoute(client: containerClient))
     try app.register(collection: ContainerResizeRoute(client: containerClient))
@@ -85,7 +86,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ContainerStatsRoute(client: containerClient))
     try app.register(collection: ContainerStopRoute(client: containerClient))
     try app.register(collection: ContainerTopRoute(client: containerClient, runner: commandRunner))
-    try app.register(collection: ContainerUnpauseRoute())
+    try app.register(collection: ContainerUnpauseRoute(client: containerClient, pauser: pauser))
     try app.register(collection: ContainerUpdateRoute(client: containerClient))
     try app.register(collection: ContainerWaitRoute(client: containerClient))
 
@@ -233,8 +234,8 @@ func configure(_ app: Application) async throws {
         // --- Podman libpod routes: stats/pause/prune/cp/push/save/load/events gaps ---
         try app.register(collection: LibpodContainerStatsRoute(client: containerClient))
         try app.register(collection: LibpodContainersStatsRoute(client: containerClient))
-        try app.register(collection: LibpodContainerPauseRoute())
-        try app.register(collection: LibpodContainerUnpauseRoute())
+        try app.register(collection: LibpodContainerPauseRoute(client: containerClient, pauser: pauser))
+        try app.register(collection: LibpodContainerUnpauseRoute(client: containerClient, pauser: pauser))
         try app.register(collection: LibpodContainerHealthcheckRoute(client: containerClient))
         try app.register(collection: LibpodContainerChangesRoute())
         try app.register(collection: LibpodContainerPruneRoute(dockerRoute: ContainerPruneRoute(client: containerClient)))
