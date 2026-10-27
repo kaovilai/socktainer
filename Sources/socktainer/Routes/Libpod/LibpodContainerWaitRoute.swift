@@ -19,7 +19,7 @@ struct LibpodContainerWaitRoute: RouteCollection {
     }
 
     enum State: String, Equatable, Sendable {
-        case running, created, paused, healthy, unhealthy
+        case running, created, paused, healthy, unhealthy, stopping, unknown
     }
 
     /// Poll interval for state conditions; podman's own default.
@@ -49,6 +49,7 @@ struct LibpodContainerWaitRoute: RouteCollection {
 
     /// "removing" (in-progress removal) maps to Docker-compat's `removed`, since this daemon has no
     /// distinct in-progress-removal state to block on; "configured" is a never-started container.
+    /// "stopping" and "unknown" are Apple Container's own `stopping`/`unknown` runtime statuses.
     static func mapLibpodCondition(_ raw: String) throws -> Condition {
         switch raw {
         case "stopped", "exited":
@@ -65,8 +66,10 @@ struct LibpodContainerWaitRoute: RouteCollection {
             return .state(.healthy)
         case "unhealthy":
             return .state(.unhealthy)
-        case "stopping", "unknown":
-            throw Abort(.notImplemented, reason: "waiting for condition '\(raw)' is not supported")
+        case "stopping":
+            return .state(.stopping)
+        case "unknown":
+            return .state(.unknown)
         default:
             throw Abort(.badRequest, reason: "Invalid wait condition: \(raw)")
         }
@@ -123,15 +126,26 @@ struct LibpodContainerWaitRoute: RouteCollection {
 
     /// Polls until the container is in one of `states` (-1), it is gone (-1, as podman reports a
     /// container that vanished), or the task is cancelled (nil).
+    ///
+    /// `stopping` is a short transition that polling can miss, so a container seen running during
+    /// this wait that is later found stopped also counts: it went through `stopping` in between.
+    /// A container already stopped when the wait begins is not stopping, and is waited on as podman
+    /// does.
     static func stateReached(
         _ states: Set<State>, nativeId: String, client: ClientContainerProtocol, app: Application,
         intervalNs: UInt64 = statePollIntervalNs
     ) async -> Int64? {
+        var sawRunning = false
         while !Task.isCancelled {
             do {
                 guard let container = try await client.getContainer(id: nativeId) else { return -1 }
                 // A paused container still runs as far as Apple Container is concerned; podman calls it paused.
                 let paused = ContainerPauseState.shared.isPaused(container)
+                if states.contains(.stopping) {
+                    if container.status == .stopping || (sawRunning && container.status == .stopped) { return -1 }
+                    if container.status == .running { sawRunning = true }
+                }
+                if states.contains(.unknown), container.status == .unknown { return -1 }
                 if states.contains(.running), container.status == .running, !paused { return -1 }
                 if states.contains(.paused), paused { return -1 }
                 if states.contains(.created), container.isNeverStarted { return -1 }
