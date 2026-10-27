@@ -276,7 +276,7 @@ func configure(_ app: Application) async throws {
     }
 
     // Initialize broadcaster
-    let broadcaster = EventBroadcaster()
+    let broadcaster = EventBroadcaster(persistenceURL: appleContainerAppSupportUrl.appendingPathComponent(EventBroadcaster.persistenceFileName))
     app.storage[EventBroadcasterKey.self] = broadcaster
     let externalEventWatcher = ExternalEventWatcher(broadcaster: broadcaster, imageClient: imageClient, logger: app.logger)
     Task { await externalEventWatcher.run() }
