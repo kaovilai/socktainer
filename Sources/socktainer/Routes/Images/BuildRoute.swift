@@ -801,7 +801,10 @@ extension BuildRoute {
             terminal: nil,  // No terminal for API
             tags: tags,
             target: target,
-            quiet: quiet,
+            // Never `true`: with it Apple's `BuildStdio` returns before sending the terminal-command reply
+            // the builder shim waits for after each output packet, so a `docker build -q` hangs for good.
+            // The build output then goes to the daemon's stderr, as it already does without `-q`.
+            quiet: false,
             exports: exports,
             cacheIn: [],
             cacheOut: [],
