@@ -327,6 +327,11 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
     private weak var channel: Channel?
     private var didReceiveInputClosed = false
     private var isChannelInactive = false
+    // Detach keys (TTY attach/exec only): once typed, the stdin writer is handed to
+    // `onDetach` instead of being closed, and the connection ends.
+    private var detachScanner: DetachKeyScanner?
+    private var onDetach: (@Sendable (FileHandle) -> Void)?
+    private var didDetach = false
 
     init(execId: String, ttyEnabled: Bool) {
         self.execId = execId
@@ -355,9 +360,67 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
     public func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let buffer = unwrapInboundIn(data)
         guard let data = buffer.getData(at: 0, length: buffer.readableBytes) else { return }
-        if writeToStdin(data) {
+        let (forward, detach) = scanForDetach(data)
+        if !forward.isEmpty, writeToStdin(forward) {
             context.channel.setOption(ChannelOptions.autoRead, value: false).whenFailure { _ in }
         }
+        if detach {
+            context.close(promise: nil)
+        }
+    }
+
+    /// Closes `writer` once the client is gone, or hands it to `handoff`: a TTY session's
+    /// stdin outlives its client in Docker. Runs after every write already queued.
+    private func release(_ writer: FileHandle?, to handoff: (@Sendable (FileHandle) -> Void)?) {
+        guard let writer else { return }
+        writeQueue.async {
+            if let handoff { handoff(writer) } else { try? writer.close() }
+        }
+    }
+
+    /// Watches stdin for `sequence` (Docker's detach keys). When it is typed the connection
+    /// closes. Whether the client detaches that way or just disconnects, the stdin writer goes
+    /// to `onDetach` rather than being closed, so the process keeps its stdin for a later
+    /// attach. Docker applies detach keys, and keeps stdin open, for TTY sessions only.
+    public func setDetachKeys(_ sequence: [UInt8], onDetach: @escaping @Sendable (FileHandle) -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard ttyEnabled else { return }
+        detachScanner = DetachKeyScanner(sequence: sequence)
+        self.onDetach = onDetach
+    }
+
+    /// Runs `data` through the detach-key scanner. Returns what to forward to stdin, and true
+    /// once the detach keys were typed — the writer is then already handed off.
+    func scanForDetach(_ data: Data) -> (forward: Data, detach: Bool) {
+        lock.lock()
+        guard !didDetach else {
+            lock.unlock()
+            return (Data(), false)
+        }
+        guard var scanner = detachScanner else {
+            lock.unlock()
+            return (data, false)
+        }
+        let (forward, detach) = scanner.feed(data)
+        detachScanner = scanner
+        guard detach else {
+            lock.unlock()
+            return (forward, false)
+        }
+        lock.unlock()
+        // Bytes typed before the keys still reach the process.
+        if !forward.isEmpty { writeToStdin(forward) }
+        lock.lock()
+        didDetach = true
+        let writer = stdinWriter
+        stdinWriter = nil
+        let handoff = onDetach
+        lock.unlock()
+        if let writer, let handoff {
+            writeQueue.async { handoff(writer) }
+        }
+        return (Data(), true)
     }
 
     /// Core write path — buffers when no writer is set yet; dispatches to
@@ -395,10 +458,9 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
             didReceiveInputClosed = true
             let writer = stdinWriter
             stdinWriter = nil
+            let handoff = onDetach
             lock.unlock()
-            if let writer {
-                writeQueue.async { try? writer.close() }
-            }
+            release(writer, to: handoff)
         } else {
             context.fireUserInboundEventTriggered(event)
         }
@@ -413,10 +475,9 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
         isChannelInactive = true
         let writer = stdinWriter
         stdinWriter = nil
+        let handoff = onDetach
         lock.unlock()
-        if let writer {
-            writeQueue.async { try? writer.close() }
-        }
+        release(writer, to: handoff)
     }
 
     /// Set the stdin writer. Publishes the writer and enqueues the buffered-data
@@ -430,15 +491,21 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
         pendingData = []
         pendingDataSize = 0
         let shouldClose = didReceiveInputClosed || isChannelInactive
+        // The client left before the writer arrived: the process keeps it, through `onDetach`.
+        let handoff = didDetach || shouldClose ? onDetach : nil
         if let writer {
-            if !shouldClose { stdinWriter = writer }
+            if !shouldClose && !didDetach { stdinWriter = writer }
             writeQueue.async { [execId] in
                 for data in buffered {
                     do { try writer.write(contentsOf: data) } catch {
                         Self.logger.error("[\(execId)] stdin flush failed: \(error)")
                     }
                 }
-                if shouldClose { try? writer.close() }
+                if let handoff {
+                    handoff(writer)
+                } else if shouldClose {
+                    try? writer.close()
+                }
             }
         }
         // Resume socket reads after the flush is enqueued, so later reads are
@@ -480,10 +547,9 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
         isChannelInactive = true
         let writer = stdinWriter
         stdinWriter = nil
+        let handoff = onDetach
         lock.unlock()
-        if let writer {
-            writeQueue.async { try? writer.close() }
-        }
+        release(writer, to: handoff)
     }
 
     /// Simulates .inputClosed without a NIO context (tests only).
@@ -492,10 +558,9 @@ public final class DockerTCPHandler: ChannelInboundHandler, @unchecked Sendable 
         didReceiveInputClosed = true
         let writer = stdinWriter
         stdinWriter = nil
+        let handoff = onDetach
         lock.unlock()
-        if let writer {
-            writeQueue.async { try? writer.close() }
-        }
+        release(writer, to: handoff)
     }
 }
 

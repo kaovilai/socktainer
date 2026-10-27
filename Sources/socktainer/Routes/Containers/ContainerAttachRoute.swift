@@ -114,8 +114,9 @@ extension ContainerAttachRoute {
         let stdin = query.stdin ?? false
         let stdout = query.stdout ?? false
         let stderr = query.stderr ?? false
-        // NOTE: Not currently implemented, we use the default keys
-        let _ = query.detachKeys ?? "ctrl-c,ctrl-p"
+        guard let detachKeys = DetachKeys.parse(query.detachKeys) else {
+            throw Abort(.badRequest, reason: "Invalid detach keys (\(query.detachKeys ?? "")) provided")
+        }
 
         // NOTE: We currently do not implement this mechanism
         //       as in Docker CLI
@@ -170,8 +171,18 @@ extension ContainerAttachRoute {
                 query: query,
                 isUpgrade: isUpgrade,
                 hasConnectionUpgrade: hasConnectionUpgrade,
-                isTTY: isTTY
+                isTTY: isTTY,
+                detachKeys: detachKeys
             )
+        }
+
+        // A running container that keeps a stdin pipe (`docker run -dit`, or a client that
+        // detached with the detach keys) takes the client's input too.
+        if stdin, stream, isUpgrade && hasConnectionUpgrade,
+            let stdinWriter = await ContainerStdinRegistry.shared.duplicateWriter(id: container.id)
+        {
+            return attachRunningWithStdin(
+                req: req, container: container, logs: logs, isTTY: isTTY, stdinWriter: stdinWriter, detachKeys: detachKeys)
         }
 
         // Set appropriate content type based on TTY mode
@@ -288,6 +299,63 @@ extension ContainerAttachRoute {
             headers: headers,
             body: body
         )
+    }
+
+    /// Attaches to a running container that keeps a stdin pipe: the client's input goes to the
+    /// process's stdin through `stdinWriter` (a duplicate of the kept write end, so the client
+    /// leaving never closes the process's stdin), its output streams from the container log,
+    /// and the detach keys end the attach with the process still running.
+    private static func attachRunningWithStdin(
+        req: Request, container: ContainerSnapshot, logs: Bool, isTTY: Bool, stdinWriter: FileHandle, detachKeys: [UInt8]
+    ) -> Response {
+        let broadcaster = req.application.storage[EventBroadcasterKey.self]
+        return Response.dockerTCPUpgrade(execId: container.id, ttyEnabled: isTTY) { channel, tcpHandler in
+            tcpHandler.setDetachKeys(detachKeys) { writer in try? writer.close() }
+            tcpHandler.setStdinWriter(stdinWriter)
+            await broadcastAttach(container: container, stream: true, logs: logs, broadcaster: broadcaster)
+
+            let containerClient = ContainerClient()
+            if let handles = try? await containerClient.logs(id: container.id), let log = handles.first {
+                if handles.count > 1 { try? handles[1].close() }
+                defer { try? log.close() }
+                // Without `logs`, only output produced from now on, as in Docker.
+                if !logs { _ = try? log.seekToEnd() }
+
+                @Sendable func drain() async throws -> Bool {
+                    var wrote = false
+                    while let data = try? log.read(upToCount: 8192), !data.isEmpty {
+                        wrote = true
+                        var buffer = channel.allocator.buffer(capacity: data.count + (isTTY ? 0 : 8))
+                        buffer.writeDockerFrame(streamType: .stdout, data: data, ttyMode: isTTY)
+                        try await channel.writeAndFlush(buffer).get()
+                    }
+                    return wrote
+                }
+
+                do {
+                    while channel.isActive {
+                        if try await drain() { continue }
+                        if (try? await containerClient.get(id: container.id))?.status != .running {
+                            try? await Task.sleep(nanoseconds: 100_000_000)
+                            _ = try await drain()
+                            break
+                        }
+                        try? await Task.sleep(nanoseconds: 100_000_000)
+                    }
+                } catch {
+                    // The client left (a write failed).
+                }
+            }
+
+            await broadcastLogDetach(
+                container: container, stream: true,
+                currentStatus: (try? await containerClient.get(id: container.id))?.status,
+                broadcaster: broadcaster)
+            _ = channel.eventLoop.submit {
+                guard channel.isActive else { return }
+                channel.close(promise: nil)
+            }
+        }
     }
 
     /// Parks `pipes` for the container's next start, or fails when another client is already
@@ -483,7 +551,8 @@ extension ContainerAttachRoute {
         query: ContainerAttachQuery,
         isUpgrade: Bool,
         hasConnectionUpgrade: Bool,
-        isTTY: Bool
+        isTTY: Bool,
+        detachKeys: [UInt8]
     ) async throws -> Response {
 
         let connectionHeader = req.headers.first(name: "Connection")?.lowercased()
@@ -509,7 +578,8 @@ extension ContainerAttachRoute {
             container: currentContainer,
             query: query,
             shouldUpgrade: shouldUpgrade,
-            isTTY: isTTY
+            isTTY: isTTY,
+            detachKeys: detachKeys
         )
     }
 
@@ -521,7 +591,8 @@ extension ContainerAttachRoute {
         container: ContainerSnapshot,
         query: ContainerAttachQuery,
         shouldUpgrade: Bool,
-        isTTY: Bool
+        isTTY: Bool,
+        detachKeys: [UInt8]
     ) async throws -> Response {
 
         let attachStdout = query.stdout ?? true
@@ -686,6 +757,19 @@ extension ContainerAttachRoute {
             let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
             await ProcessRegistry.shared.set(id: container.id, process: process)
 
+            // A TTY client that leaves (detach keys, or the Docker CLI closing the connection
+            // after reading them itself) leaves the process its stdin, for a later attach.
+            let containerId = container.id
+            tcpHandler.setDetachKeys(detachKeys) { writer in
+                Task {
+                    // The exit monitor removes the process before it drops kept stdin.
+                    if await ProcessRegistry.shared.get(id: containerId) != nil {
+                        await ContainerStdinRegistry.shared.park(id: containerId, writer: writer)
+                    } else {
+                        try? writer.close()
+                    }
+                }
+            }
             tcpHandler.setStdinWriter(pipes.stdin!.write)
 
             await withTaskGroup(of: Void.self) { group in

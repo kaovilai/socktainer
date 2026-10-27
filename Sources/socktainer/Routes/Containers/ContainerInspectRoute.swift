@@ -106,7 +106,7 @@ extension ContainerInspectRoute {
                 AttachStderr: true,  // no mechanism to derive this value
                 ExposedPorts: exposedPorts.isEmpty ? nil : exposedPorts,
                 Tty: container.configuration.initProcess.terminal,
-                OpenStdin: false,  // no mechanism to derive this value
+                OpenStdin: ContainerStdinRegistry.opensStdin(container),
                 StdinOnce: false,  // no mechanism to derive this value
                 Env: container.configuration.initProcess.environment.isEmpty ? nil : container.configuration.initProcess.environment,
                 Cmd: container.configuration.initProcess.arguments.isEmpty ? nil : container.configuration.initProcess.arguments,

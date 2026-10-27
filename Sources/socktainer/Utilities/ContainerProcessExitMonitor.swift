@@ -28,6 +28,8 @@ enum ContainerProcessExitMonitor {
     ) async -> Int32 {
         let code = await ContainerExitCodeStore.resolveExitCode(retryDelayNs: exitCodeRetryDelayNs, wait: wait)
         await ProcessRegistry.shared.remove(id: nativeId)
+        // A client that detached with the detach keys left the process its stdin.
+        await ContainerStdinRegistry.shared.close(id: nativeId)
 
         // Claim before the flush grace: the start-route observer reserves the run when
         // `POST /start` returns, so claiming after a 200ms sleep would decide ownership by
