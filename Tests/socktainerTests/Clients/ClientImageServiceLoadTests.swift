@@ -189,6 +189,93 @@ struct ClientImageServiceLoadTests {
             ])
     }
 
+    @Test("a pulled multi-platform image, holding only its own platform's blobs, saves and loads back")
+    func pulledMultiPlatformImageSavesPresentPlatform() async throws {
+        let fixture = try ImageTarballFixture()
+        defer { fixture.cleanUp() }
+
+        let present = try fixture.writeImage()
+        let index = try fixture.nestedIndex(of: [present, fixture.manifestWithoutBlobs(arch: "amd64")])
+        let reference = "docker.io/library/crafted-pulled:latest"
+        try await fixture.storeAsPulled(index, reference: reference)
+
+        let saved = try await fixture.saveTarball(references: [reference])
+        let reloaded = try await fixture.loadIntoEmptyStore(saved)
+
+        #expect(reloaded == [reference])
+    }
+
+    @Test("an OCI layout written for a pulled image lists only the complete platform, store untouched")
+    func savedLayoutKeepsOnlyCompletePlatform() async throws {
+        let fixture = try ImageTarballFixture()
+        defer { fixture.cleanUp() }
+
+        let present = try fixture.writeImage()
+        let index = try fixture.nestedIndex(of: [present, fixture.manifestWithoutBlobs(arch: "amd64")])
+        let reference = "docker.io/library/crafted-layout:latest"
+        try await fixture.storeAsPulled(index, reference: reference)
+        let storeBlobsBefore = try fixture.storeBlobNames()
+
+        let out = fixture.workDir.appendingPathComponent("out")
+        try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+        try await ClientImageService.writeOCILayout(
+            references: [reference],
+            imageStore: ImageStore(path: fixture.storeDir),
+            contentRoot: fixture.storeDir.appendingPathComponent("content"),
+            to: out,
+            platform: nil,
+            logger: fixture.logger
+        )
+
+        let top = try JSONDecoder().decode(Index.self, from: Data(contentsOf: out.appendingPathComponent("index.json")))
+        let saved = try #require(top.manifests.first)
+        #expect(top.manifests.count == 1)
+        #expect(saved.annotations?["io.containerd.image.name"] == reference)
+        let savedIndex = try JSONDecoder().decode(
+            Index.self, from: Data(contentsOf: out.appendingPathComponent("blobs/sha256/\(saved.digest.dropFirst(7))")))
+        #expect(savedIndex.manifests.map(\.digest) == [present.digest])
+        #expect(try fixture.storeBlobNames() == storeBlobsBefore)
+    }
+
+    @Test("a save of an image with several complete platforms tags only the host's in the docker-archive manifest")
+    func multiPlatformSaveTagsOnePlatform() async throws {
+        let fixture = try ImageTarballFixture()
+        defer { fixture.cleanUp() }
+
+        let amd64 = try fixture.writeImage(arch: "amd64")
+        let arm64 = try fixture.writeImage(arch: "arm64")
+        let index = try fixture.nestedIndex(of: [amd64, arm64])
+        let reference = "docker.io/library/crafted-multi:latest"
+        try await fixture.storeAsPulled(index, reference: reference)
+
+        let saved = try await fixture.saveTarball(references: [reference])
+        let extracted = fixture.workDir.appendingPathComponent("extracted-multi")
+        try ArchiveUtility.extract(tarPath: saved, to: extracted, logger: fixture.logger)
+
+        let manifests = try #require(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: extracted.appendingPathComponent("manifest.json"))) as? [[String: Any]])
+        #expect(manifests.count == 1)
+        let configName = try #require(manifests.first?["Config"] as? String)
+        let config = try #require(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: extracted.appendingPathComponent(configName))) as? [String: Any])
+        #expect(config["architecture"] as? String == Platform.current.architecture)
+    }
+
+    @Test("saving a platform the image has no content for is reported as not found")
+    func savingAbsentPlatformIsNotFound() async throws {
+        let fixture = try ImageTarballFixture()
+        defer { fixture.cleanUp() }
+
+        let present = try fixture.writeImage()
+        let index = try fixture.nestedIndex(of: [present, fixture.manifestWithoutBlobs(arch: "amd64")])
+        let reference = "docker.io/library/crafted-absent:latest"
+        try await fixture.storeAsPulled(index, reference: reference)
+
+        await #expect(throws: ClientImageError.self) {
+            _ = try await fixture.saveTarball(references: [reference], platform: Platform(arch: "amd64", os: "linux"))
+        }
+    }
+
 }
 
 /// `retagForPush` (used by both `podman push <image> <destination>` and `podman manifest
@@ -251,10 +338,10 @@ private struct ImageTarballFixture {
         try? FileManager.default.removeItem(at: workDir)
     }
 
-    func writeImage() throws -> Descriptor {
+    func writeImage(arch: String = "arm64") throws -> Descriptor {
         let layer = try writeLayerBlob()
         let config = try writeBlob(
-            Data(#"{"architecture":"arm64","os":"linux","config":{},"rootfs":{"type":"layers","diff_ids":["\#(layer.digest)"]}}"#.utf8))
+            Data(#"{"architecture":"\#(arch)","os":"linux","config":{},"rootfs":{"type":"layers","diff_ids":["\#(layer.digest)"]}}"#.utf8))
         let manifest = Manifest(
             config: Descriptor(mediaType: MediaTypes.imageConfig, digest: config.digest, size: config.size),
             layers: [Descriptor(mediaType: MediaTypes.imageLayer, digest: layer.digest, size: layer.size)]
@@ -264,7 +351,7 @@ private struct ImageTarballFixture {
             mediaType: MediaTypes.imageManifest,
             digest: written.digest,
             size: written.size,
-            platform: Platform(arch: "arm64", os: "linux")
+            platform: Platform(arch: arch, os: "linux")
         )
     }
 
@@ -330,10 +417,26 @@ private struct ImageTarballFixture {
         try await load(tarball, into: workDir.appendingPathComponent("store-\(UUID().uuidString)"))
     }
 
-    func saveTarball(references: [String]) async throws -> URL {
+    /// Puts `index` in the store exactly as a single-platform pull leaves it: the full
+    /// upstream index, but only the blobs that were fetched (those written to the layout).
+    func storeAsPulled(_ index: Descriptor, reference: String) async throws {
+        let blobs = storeDir.appendingPathComponent("content/blobs/sha256")
+        try FileManager.default.createDirectory(at: blobs, withIntermediateDirectories: true)
+        for name in try FileManager.default.contentsOfDirectory(atPath: layoutDir.appendingPathComponent("blobs/sha256").path) {
+            try FileManager.default.copyItem(
+                at: layoutDir.appendingPathComponent("blobs/sha256/\(name)"), to: blobs.appendingPathComponent(name))
+        }
+        try await ImageStore(path: storeDir).create(description: Image.Description(reference: reference, descriptor: index))
+    }
+
+    func storeBlobNames() throws -> Set<String> {
+        Set(try FileManager.default.contentsOfDirectory(atPath: storeDir.appendingPathComponent("content/blobs/sha256").path))
+    }
+
+    func saveTarball(references: [String], platform: Platform? = nil) async throws -> URL {
         let saved = try await service.exportTarball(
             resolvedReferences: references,
-            platform: nil,
+            platform: platform,
             appleContainerAppSupportUrl: storeDir,
             logger: logger
         )
