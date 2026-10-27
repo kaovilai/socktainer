@@ -422,11 +422,17 @@ struct ClientContainerService: ClientContainerProtocol {
         // `docker compose up`) parked its pipes; boot with them so its stream gets the output.
         // Claimed before anything can fail, so every failure below reaches the waiting attach.
         let attached = await PendingAttachStart.shared.claim(containerId: container.id)
-        let stdio = attached?.stdioArray ?? [nil, nil, nil]
+        // Started with no client attached but created with `OpenStdin` (`docker run -di`,
+        // Compose `stdin_open`): boot with a stdin pipe nobody writes yet, so the process waits
+        // on its stdin as in Docker and a later `docker attach` can type into it.
+        let detachedStdin =
+            attached == nil && ContainerStdinRegistry.opensStdin(container) ? StdioPipes.make([.stdin]) : nil
+        let stdio = attached?.stdioArray ?? detachedStdin?.stdioArray ?? [nil, nil, nil]
 
         do {
             try await prepareForStart(container: container)
         } catch {
+            detachedStdin?.closeAll()
             if let attached {
                 attached.closeAll()
                 await PendingAttachStart.shared.finish(containerId: container.id, result: .failure(error))
@@ -438,6 +444,7 @@ struct ClientContainerService: ClientContainerProtocol {
         do {
             process = try await containerClient.withClient { try await $0.bootstrap(id: container.id, stdio: stdio) }
         } catch {
+            detachedStdin?.closeAll()
             if let attached {
                 attached.closeAll()
                 await PendingAttachStart.shared.finish(containerId: container.id, result: .failure(error))
@@ -455,6 +462,7 @@ struct ClientContainerService: ClientContainerProtocol {
             try await ExtraHostsFile.refresh(containerId: container.id)
             try await process.start()
         } catch {
+            detachedStdin?.closeAfterHandoff()
             if let attached {
                 attached.closeAfterHandoff()
                 await PendingAttachStart.shared.finish(containerId: container.id, result: .failure(error))
@@ -469,6 +477,12 @@ struct ClientContainerService: ClientContainerProtocol {
             return
         }
 
+        // A detached TTY container is resized through `docker attach`, which needs its process.
+        await ProcessRegistry.shared.set(id: container.id, process: process)
+        if let stdinWriter = detachedStdin?.stdin?.write {
+            await ContainerStdinRegistry.shared.park(id: container.id, writer: stdinWriter)
+        }
+
         // Wait for the init process in the background so we can capture its
         // real exit code without blocking the /start response.
         let containerId = container.id
@@ -477,6 +491,8 @@ struct ClientContainerService: ClientContainerProtocol {
             let code = await ContainerExitCodeStore.resolveExitCode(logger: exitLogger) {
                 try await process.wait()
             }
+            await ProcessRegistry.shared.remove(id: containerId)
+            await ContainerStdinRegistry.shared.close(id: containerId)
             await ContainerExitCodeStore.shared.set(id: containerId, code: code)
         }
     }

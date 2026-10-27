@@ -727,6 +727,7 @@ extension ContainerCreateRoute {
 
                 // Never trust a client-supplied value: it names a directory socktainer deletes.
                 containerConfiguration.labels[ExtraHostsFile.label] = nil
+                containerConfiguration.labels[ContainerStdinRegistry.openStdinLabel] = body.OpenStdin == true ? "true" : nil
 
                 containerConfiguration.mounts = resolvedMounts
                 // Always overwrite client-supplied metadata, including an empty list.
