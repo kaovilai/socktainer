@@ -89,6 +89,7 @@ struct DockerContainerFilterUtility {
             "status",
             "exited",
             "label",
+            "label!",
             "name",
             "id",
             "ancestor",
@@ -128,6 +129,15 @@ struct DockerContainerFilterUtility {
                     } else if let str = value as? String {
                         parsedFilters[key] = [str]
                     }
+                }
+                // `--filter label!=k=v` reaches the API as the key `label!` with value `k=v`; fold it
+                // into the label filter in its `k!=v` form, which applyFilters understands.
+                if let negated = parsedFilters.removeValue(forKey: "label!") {
+                    let converted = negated.map { value -> String in
+                        guard let equals = value.firstIndex(of: "=") else { return value + "!=" }
+                        return value[..<equals] + "!=" + value[value.index(after: equals)...]
+                    }
+                    parsedFilters["label", default: []].append(contentsOf: converted)
                 }
                 logger.debug("Decoded filters: \(parsedFilters)")
             } else {

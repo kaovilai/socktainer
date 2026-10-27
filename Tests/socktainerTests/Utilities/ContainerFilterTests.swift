@@ -24,6 +24,21 @@ struct ContainerFilterTests {
         #expect(filters == [key: ["selected"]])
     }
 
+    @Test("`--filter label!=k=v` (the key `label!`) is folded into the label filter's k!=v form")
+    func negatedLabelFilter() throws {
+        let filters = try DockerContainerFilterUtility.parseContainerFilters(
+            filtersParam: #"{"label!":["tier=a","solo"],"label":["x=1"]}"#, logger: Logger(label: "test"))
+        #expect(filters["label"]?.sorted() == ["solo!=", "tier!=a", "x=1"])
+        #expect(filters["label!"] == nil)
+
+        let containers = [
+            try makeSnapshot(id: "a", status: .running, labels: ["tier": "a"]),
+            try makeSnapshot(id: "b", status: .running, labels: ["tier": "b"]),
+        ]
+        let kept = ClientContainerService.applyFilters(containers, filters: ["label": ["tier!=a"]])
+        #expect(kept.map(\.id) == ["b"], "kept: \(kept.map(\.id))")
+    }
+
     @Test(
         "array and string filter forms remain supported",
         arguments: [

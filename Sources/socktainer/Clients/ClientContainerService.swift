@@ -185,8 +185,14 @@ struct ClientContainerService: ClientContainerProtocol {
                         guard let eqIdx = labelFilter.firstIndex(of: "=") else {
                             return LabelNormalization.filterContainsKey(labelFilter, in: labels)
                         }
-                        let k = String(labelFilter.prefix(upTo: eqIdx))
+                        var k = String(labelFilter.prefix(upTo: eqIdx))
                         let v = String(labelFilter.suffix(from: labelFilter.index(after: eqIdx)))
+                        // `key!=value` (docker ps --filter label!=key=value): keep containers without that value.
+                        if k.hasSuffix("!") {
+                            k.removeLast()
+                            if v.isEmpty { return !LabelNormalization.filterContainsKey(k, in: labels) }
+                            return LabelNormalization.filterValue(in: labels, forKey: k) != v
+                        }
                         return LabelNormalization.filterValue(in: labels, forKey: k) == v
                     }
                 }
