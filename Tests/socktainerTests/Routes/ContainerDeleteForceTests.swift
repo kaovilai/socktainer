@@ -110,6 +110,39 @@ struct ContainerDeleteForceTests {
         #expect(await log.calls == expected)
     }
 
+    @Test("Removing a paused container without force is moby's 409; with force it clears the paused entry")
+    func pausedContainer() async throws {
+        let snapshot = Self.snapshot(id: "po-paused", status: .running)
+        let pauseState = ContainerPauseState()
+        pauseState.markPaused(snapshot)
+
+        for (query, status) in [("", HTTPStatus.conflict), ("?force=1", .noContent)] {
+            let log = CallLog()
+            let mock = RecordingDeleteMock(snapshot: snapshot, log: log)
+            try await withApp(configure: { _ in }) { app in
+                let router = app.regexRouter(with: app.logger)
+                app.setRegexRouter(router)
+                router.installMiddleware(on: app)
+                app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+                try app.register(collection: ContainerDeleteRoute(client: mock, pauseState: pauseState))
+                try await app.testing().test(.DELETE, "/v1.51/containers/po-paused\(query)") { res async in
+                    #expect(res.status == status)
+                    if status == .conflict {
+                        #expect(
+                            res.body.string.contains(#"cannot remove container \"po-paused\": container is paused and must be unpaused first"#))
+                    }
+                }
+            }
+            if status == .conflict {
+                #expect(await log.calls.isEmpty)
+                #expect(pauseState.isPaused(snapshot))
+            } else {
+                #expect(await log.calls == ["stop", "delete"])
+                #expect(pauseState.recordedIDs.isEmpty)
+            }
+        }
+    }
+
     private static func snapshot(id: String, status: RuntimeStatus) -> ContainerSnapshot {
         let proc = ProcessConfiguration(
             executable: "/bin/sh", arguments: [], environment: [],
