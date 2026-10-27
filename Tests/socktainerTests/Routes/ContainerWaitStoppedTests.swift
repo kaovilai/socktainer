@@ -149,4 +149,50 @@ struct ContainerWaitStoppedTests {
         #expect(result.StatusCode == 7)
         continuation.finish()
     }
+
+    /// `docker start -a` and a `docker run` reusing a removed container's name issue a `next-exit`
+    /// wait while an earlier run's exit code is still recorded; reporting it would end the wait
+    /// before the new run even started.
+    @Test("next-exit ignores an exit code recorded before the wait and reports the next one")
+    func nextExitIgnoresStaleCode() async throws {
+        let identifier = "wait-next-exit"
+        await ContainerExitCodeStore.shared.set(id: identifier, code: 3)
+        let generation = await ContainerExitCodeStore.shared.generation(id: identifier)
+
+        let stopped = try snapshot(id: identifier, status: .stopped)
+        let client = LifecycleClient(running: stopped, stopped: stopped, runningPolls: 0)
+
+        let recorder = Task {
+            try await Task.sleep(nanoseconds: 300_000_000)
+            // What start() does, then the new run's exit.
+            await ContainerExitCodeStore.shared.remove(id: identifier)
+            await ContainerExitCodeStore.shared.set(id: identifier, code: 5)
+        }
+        let result = await ContainerWaitRoute.resolveNotRunning(
+            containerId: identifier,
+            client: client,
+            condition: .nextExit,
+            nextExitAfter: (identifier, generation),
+            storeTimeoutNs: 5_000_000_000
+        )
+        try await recorder.value
+
+        #expect(result.StatusCode == 5)
+        await ContainerExitCodeStore.shared.remove(id: identifier)
+    }
+
+    @Test("the exit-code store only reports a code recorded after a given generation")
+    func storeGenerations() async {
+        let identifier = "store-generation"
+        let store = ContainerExitCodeStore()
+        let before = await store.generation(id: identifier)
+        await store.set(id: identifier, code: 1)
+        #expect(await store.get(id: identifier, recordedAfter: before) == 1)
+        let after = await store.generation(id: identifier)
+        #expect(await store.get(id: identifier, recordedAfter: after) == nil)
+        await store.remove(id: identifier)
+        #expect(await store.generation(id: identifier) == after, "removing a code must not rewind the count")
+        await store.set(id: identifier, code: 2)
+        #expect(await store.get(id: identifier, recordedAfter: after) == 2)
+    }
 }

@@ -775,6 +775,9 @@ extension ContainerCreateRoute {
                             containerConfiguration.labels[ExtraHostsFile.label] = generated.label
                         }
                         try await containerClient.create(configuration: containerConfiguration, options: options, kernel: kernel)
+                        // Exit codes are kept by name: drop one left by a removed container of the same
+                        // name, or a wait issued before this one starts would report it.
+                        await ContainerExitCodeStore.shared.remove(id: containerConfiguration.id)
                     } catch {
                         try? await PreStartInjectionStore.shared.clear(containerId: containerConfiguration.id)
                         ExtraHostsFile.remove(labels: containerConfiguration.labels)
