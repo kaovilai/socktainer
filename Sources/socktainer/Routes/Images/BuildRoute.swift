@@ -524,6 +524,8 @@ extension BuildRoute {
 
         // Helper function to send Docker API compliant streaming messages
         @Sendable func sendStreamMessage(_ message: String) {
+            // `-q` / `q=1`: like moby, send no progress output, only the image id below.
+            guard !quiet else { return }
             // Preserve the original message with its formatting
             sendEvent(["stream": message + "\n"])
         }
@@ -705,7 +707,8 @@ extension BuildRoute {
         // the bare image ID as its own stream line for exactly this reason;
         // mirror that here so the client recognizes success.
         let bareID = builtDigest.hasPrefix("sha256:") ? String(builtDigest.dropFirst("sha256:".count)) : builtDigest
-        sendStreamMessage(bareID)
+        // Sent even when quiet: podman's build client takes the image id from this line.
+        sendEvent(["stream": bareID + "\n"])
 
         // Docker leaves an untagged build as <none>:<none>. Apple Container cannot store a
         // nameless image, so rename it to the "untagged@<digest>" name the store itself gives
@@ -725,7 +728,7 @@ extension BuildRoute {
         if imageID == nil {
             logger.warning("BuildRoute: could not determine the image ID of \(imageName ?? "untagged build")")
         }
-        for event in completionEvents(imageID: imageID, tag: imageName, includeAux: includeAux) {
+        for event in completionEvents(imageID: imageID, tag: imageName, includeAux: includeAux) where !quiet || event["aux"] != nil {
             sendEvent(event)
         }
 
