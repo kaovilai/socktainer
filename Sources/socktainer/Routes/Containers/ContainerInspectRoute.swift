@@ -199,7 +199,7 @@ extension ContainerInspectRoute {
                 OOMKilled: false,
                 Dead: container.status == .stopped && !isPendingRestart && !container.isNeverStarted,
                 Pid: 0,  // we have no mechanism to derive PID in Apple container
-                ExitCode: container.status == .stopped ? 0 : 0,
+                ExitCode: container.status == .stopped ? Int(await ContainerExitCodeStore.recordedExitCode(for: container)) : 0,
                 Error: "",
                 StartedAt: container.startedDate.map { AppleContainerTimestampResolver.iso8601Timestamp($0) } ?? "",
                 FinishedAt: container.isNeverStarted ? "0001-01-01T00:00:00Z" : (container.status == .stopped ? "1970-01-01T00:00:00.000000000Z" : ""),

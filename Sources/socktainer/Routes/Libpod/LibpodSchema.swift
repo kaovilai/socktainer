@@ -50,7 +50,7 @@ enum LibpodSchema {
             "Exited": state == "exited",
             // Apple Container keeps no separate stop time; the start time is the closest known.
             "ExitedAt": state == "exited" ? Int(startedAt ?? created) : 0,
-            "ExitCode": 0,
+            "ExitCode": exitCode(fromDockerStatus: docker["Status"] as? String ?? ""),
             "Id": docker["Id"] as? String ?? "",
             "Image": docker["Image"] as? String ?? "",
             "ImageID": imageID,
@@ -112,6 +112,12 @@ enum LibpodSchema {
             summary["IsManifestList"] = false
             return summary
         }
+    }
+
+    /// "Exited (7)" → 7; 0 when the status carries no code.
+    static func exitCode(fromDockerStatus status: String) -> Int {
+        guard let open = status.range(of: "Exited ("), let close = status[open.upperBound...].firstIndex(of: ")") else { return 0 }
+        return Int(status[open.upperBound..<close]) ?? 0
     }
 
     /// "Up 2 hours (healthy)" → "healthy"; empty when the container has no health state.

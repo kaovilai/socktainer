@@ -44,6 +44,15 @@ struct LibpodSchemaTests {
         #expect(summary["Status"] as? String == "")
     }
 
+    @Test("the exit code is read from Docker's `Exited (N)` status")
+    func exitCodeFromStatus() {
+        #expect(LibpodSchema.exitCode(fromDockerStatus: "Exited (7)") == 7)
+        #expect(LibpodSchema.exitCode(fromDockerStatus: "Exited (137) 2 minutes ago") == 137)
+        #expect(LibpodSchema.exitCode(fromDockerStatus: "Exited") == 0)
+        #expect(LibpodSchema.exitCode(fromDockerStatus: "Up 3 hours") == 0)
+        #expect(LibpodSchema.containerSummary(["Id": "x", "State": "exited", "Status": "Exited (3)", "Created": 100])["ExitCode"] as? Int == 3)
+    }
+
     @Test("prune answers are arrays of per-item reports, not Docker's envelope")
     func pruneReports() {
         let containers = array(LibpodSchema.containerPruneReports(["ContainersDeleted": ["a", "b"], "SpaceReclaimed": 10]))
