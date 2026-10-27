@@ -208,4 +208,93 @@ struct ImageLayerChangesTests {
         #expect(manifest["mediaType"] as? String == ContainerImageUtility.dockerManifestMediaType)
         #expect((manifest["layers"] as? [[String: Any]])?.first?["mediaType"] as? String == "application/vnd.docker.image.rootfs.diff.tar.gzip")
     }
+
+    // MARK: - podman image diff
+
+    @Test("layer entries are read from a gzip blob with whiteouts and opaque markers recognized")
+    func readsLayer() throws {
+        let dir = try Self.scratch()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let blob = dir.appendingPathComponent("layer.tar.gz")
+        try Self.writeTar(
+            [.dir("./etc"), .file("./etc/hosts", "x"), .whiteout("./etc/.wh.motd"), .whiteout("./var/cache/.wh..wh..opq"), .symlink("bin", "usr/bin")],
+            filter: .gzip, to: blob)
+
+        let entries = try ImageLayerChanges.readLayer(at: blob)
+        #expect(entries.count == 5)
+        #expect(entries[2] == .whiteout("/etc/motd"))
+        #expect(entries[3] == .opaque("/var/cache"))
+        guard case .entry(let path, let info) = entries[4] else {
+            Issue.record("expected an entry")
+            return
+        }
+        #expect(path == "/bin")
+        #expect(info.linkTarget == "usr/bin")
+        guard case .entry(_, let hosts) = entries[1] else {
+            Issue.record("expected an entry")
+            return
+        }
+        #expect(hosts.size == 1)
+        #expect(hosts.mode == 0o644)
+        #expect(!hosts.isDirectory)
+    }
+
+    @Test("whiteouts and opaque directories remove lower-layer paths")
+    func appliesLayers() {
+        let tree = ImageLayerChanges.tree(of: [
+            [
+                .entry("/etc", Self.info(dir: true)), .entry("/etc/motd", Self.info()), .entry("/var", Self.info(dir: true)),
+                .entry("/var/cache", Self.info(dir: true)), .entry("/var/cache/a", Self.info()), .entry("/opt", Self.info(dir: true)),
+                .entry("/opt/x", Self.info()),
+            ],
+            [.whiteout("/etc/motd"), .opaque("/var/cache"), .entry("/var/cache/b", Self.info()), .entry("/opt", Self.info())],
+        ])
+        #expect(tree.keys.sorted() == ["/etc", "/opt", "/var", "/var/cache", "/var/cache/b"])
+    }
+
+    @Test("top-layer changes: whiteout is D, entry over a lower path is C, new entry is A, its directory C")
+    func classifiesTopLayer() {
+        let lower = ImageLayerChanges.tree(of: [
+            [
+                .entry("/etc", Self.info(dir: true)), .entry("/etc/passwd", Self.info()), .entry("/bin", Self.info(dir: true)),
+                .entry("/bin/sh", Self.info()),
+            ]
+        ])
+        let changes = ImageLayerChanges.topLayerChanges(
+            [
+                .entry("/etc/passwd", Self.info(size: 9)), .entry("/etc/new", Self.info()), .whiteout("/bin/sh"),
+                .whiteout("/never-existed"), .entry("/srv", Self.info(dir: true)), .entry("/srv/app", Self.info()),
+            ],
+            lower: lower)
+        #expect(
+            changes == [
+                Self.change("/bin", .modified), Self.change("/bin/sh", .deleted), Self.change("/etc", .modified),
+                Self.change("/etc/new", .added), Self.change("/etc/passwd", .modified), Self.change("/srv", .added),
+                Self.change("/srv/app", .added),
+            ])
+    }
+
+    @Test("image-to-image changes list each added path, the top of a deleted tree, and changed directories")
+    func comparesTrees() {
+        let old: [String: ImageLayerChanges.EntryInfo] = [
+            "/etc": Self.info(dir: true), "/etc/passwd": Self.info(size: 1), "/etc/group": Self.info(),
+            "/var": Self.info(dir: true), "/var/lib": Self.info(dir: true), "/var/lib/x": Self.info(),
+        ]
+        let new: [String: ImageLayerChanges.EntryInfo] = [
+            "/etc": Self.info(dir: true), "/etc/passwd": Self.info(size: 2), "/etc/group": Self.info(),
+            "/srv": Self.info(dir: true), "/srv/app": Self.info(),
+        ]
+        #expect(
+            ImageLayerChanges.treeChanges(from: old, to: new) == [
+                Self.change("/etc", .modified), Self.change("/etc/passwd", .modified), Self.change("/srv", .added),
+                Self.change("/srv/app", .added), Self.change("/var", .deleted),
+            ])
+    }
+
+    @Test("a directory sorts before its contents and before siblings sharing its prefix")
+    func sortsDirectoriesFirst() {
+        let lower = ImageLayerChanges.tree(of: [[.entry("/a", Self.info(dir: true))]])
+        let changes = ImageLayerChanges.topLayerChanges([.entry("/a-b", Self.info()), .entry("/a/b", Self.info())], lower: lower)
+        #expect(changes.map(\.path) == ["/a", "/a/b", "/a-b"])
+    }
 }

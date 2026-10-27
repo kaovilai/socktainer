@@ -238,7 +238,9 @@ func configure(_ app: Application) async throws {
         try app.register(collection: LibpodContainerPauseRoute(client: containerClient, pauser: pauser))
         try app.register(collection: LibpodContainerUnpauseRoute(client: containerClient, pauser: pauser))
         try app.register(collection: LibpodContainerHealthcheckRoute(client: containerClient))
-        try app.register(collection: LibpodContainerChangesRoute(containerClient: containerClient, changesClient: archiveClient))
+        try app.register(
+            collection: LibpodContainerChangesRoute(
+                containerClient: containerClient, changesClient: archiveClient, imageChanges: LibpodImageChangesRoute.lookup(systemConfig: systemConfig)))
         try app.register(collection: LibpodContainerPruneRoute(dockerRoute: ContainerPruneRoute(client: containerClient)))
         try app.register(collection: LibpodContainerUpdateRoute(client: containerClient))
         try app.register(collection: LibpodContainerExportRoute(containerClient: containerClient, archiveClient: archiveClient))
@@ -255,6 +257,7 @@ func configure(_ app: Application) async throws {
         try app.register(collection: LibpodImageImportRoute(client: imageClient))
         try app.register(collection: LibpodImageSearchRoute(dockerRoute: ImageSearchRoute()))
         try app.register(collection: LibpodImageHistoryRoute(systemConfig: systemConfig))
+        try app.register(collection: LibpodImageChangesRoute(systemConfig: systemConfig))
         try app.register(collection: LibpodCommitRoute(containerClient: containerClient, archiveClient: archiveClient, imageClient: imageClient))
         try app.register(collection: LibpodContainerExistsRoute(client: containerClient))
         try app.register(collection: LibpodImageExistsRoute(systemConfig: systemConfig))
