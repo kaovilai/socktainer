@@ -37,10 +37,11 @@ Limits that Docker-compat shares (libpod mirrors Docker-compat's support, it doe
   no freezer or pause primitive). Paused state is persisted (`socktainer-paused.json`) and survives a
   daemon restart; entries for containers stopped or restarted while the daemon was down are dropped
   at startup. An image without a shell gets only PID 1 stopped. `exec` into a paused container is a
-  409, as on Docker and podman.
+  409, as on Docker and podman; so is `rm` without force (`container is paused and must be unpaused
+  first`), and a force-removed paused container's entry is dropped at once.
 - `commit` writes the base image's layers plus one layer holding the container's changes (whiteouts
-  for deletions), like moby. It falls back to a single squashed layer for a never-started container
-  or when the base image's layers are no longer stored. The container is not paused while it is
+  for deletions), like moby; a never-started container gets the base layers plus an empty layer. It
+  falls back to a single squashed layer when the base image's layers are no longer stored. The container is not paused while it is
   read; its guest page cache is flushed first, as for `export`.
 - `diff` compares the container's `rootfs.ext4` with the image snapshot it was cloned from;
   `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` are hidden as Docker's init layer hides them.
@@ -57,8 +58,9 @@ Limits that Docker-compat shares (libpod mirrors Docker-compat's support, it doe
   copies. To share, create the volume with local-driver bind options
   (`--opt type=none --opt o=bind --opt device=/host/dir`, also Compose `driver_opts`): it is the host
   directory over virtiofs, any number of running containers can mount it, it is reported as a
-  volume and cannot be removed while in use. Unlike a default volume it gets no copy-up of image
-  content. Directory-backed default volumes are not viable: virtiofs ignores `chown` and rejects
+  volume and cannot be removed while in use. Like a default volume it gets a copy-up of image
+  content when its host directory is empty at create time (not with `nocopy`); ownership stays the
+  host user's. Directory-backed default volumes are not viable: virtiofs ignores `chown` and rejects
   `chmod` on the share root.
 - `podman cp` out of a container to a host path under `/tmp` fails inside the podman client on macOS
   (`/tmp` is a symlink to `/private/tmp`); copying to a real directory works.
@@ -78,12 +80,12 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 
 | Command | Method + Path | Implemented |
 |---|---|---|
-| `podman ps` / `ps -a` | GET `/libpod/containers/json` | ✅ |
+| `podman ps` / `ps -a` | GET `/libpod/containers/json` | ✅ (`--filter volume=` matches a volume name, mount destination or bind source; socktainer's internal bookkeeping labels are hidden from `Labels` and label filters) |
 | `podman create` | POST `/libpod/containers/create` | ✅ |
 | `podman start` | POST `/libpod/containers/{id}/start` | ✅ |
 | `podman stop` | POST `/libpod/containers/{id}/stop` | ✅ |
 | `podman kill` | POST `/libpod/containers/{id}/kill` | ✅ |
-| `podman restart` | POST `/libpod/containers/{id}/restart` | ✅ |
+| `podman restart` | POST `/libpod/containers/{id}/restart` | ✅ (logs kill, died, stop, start, restart; `died` has no exit code, since Apple's init wait resolves only at the next run's exit) |
 | `podman rm` | DELETE `/libpod/containers/{id}` | ✅ |
 | `podman inspect` (container) | GET `/libpod/containers/{id}/json` | ✅ |
 | `podman logs` | GET `/libpod/containers/{id}/logs` | ✅ |
