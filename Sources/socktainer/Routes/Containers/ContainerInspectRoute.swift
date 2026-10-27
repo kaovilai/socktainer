@@ -215,7 +215,8 @@ extension ContainerInspectRoute {
                 Paused: false,  // Apple containers don't have a paused state like Docker
                 Restarting: isPendingRestart,
                 OOMKilled: false,
-                Dead: container.status == .stopped && !isPendingRestart && !container.isNeverStarted,
+                // Docker's "dead" is a container whose removal failed partway; an exited one is not dead.
+                Dead: false,
                 Pid: 0,  // we have no mechanism to derive PID in Apple container
                 ExitCode: container.status == .stopped ? Int(await ContainerExitCodeStore.recordedExitCode(for: container)) : 0,
                 Error: "",
