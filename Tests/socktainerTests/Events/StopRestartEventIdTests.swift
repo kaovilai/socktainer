@@ -44,6 +44,33 @@ struct StopRestartEventIdTests {
         #expect(event?.Actor.Attributes["name"] == "sockt-evtid-native")
     }
 
+    @Test("stop logs moby's kill (signal=15 by default) before stop")
+    func stopEmitsKillBeforeStop() async throws {
+        let snapshot = Self.snapshot(nativeId: "sockt-evtid-native")
+        let broadcaster = EventBroadcaster()
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = broadcaster
+            try app.register(collection: ContainerStopRoute(client: FixedSnapshotMock(snapshot: snapshot)))
+
+            try await app.testing().test(.POST, "/v1.51/containers/sockt-evtid-native/stop") { res async in
+                #expect(res.status == .noContent)
+            }
+            try await app.testing().test(.POST, "/v1.51/containers/sockt-evtid-native/stop?signal=SIGINT") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        let events = await broadcaster.recentEvents()
+        #expect(events.map(\.Action) == ["kill", "stop", "kill", "stop"])
+        #expect(events[0].Actor.ID == DockerContainerID.hexId(for: snapshot))
+        #expect(events[0].Actor.Attributes["signal"] == "15")
+        #expect(events[2].Actor.Attributes["signal"] == "2")
+    }
+
     @Test("restart event carries the 64-char hex id, not the request reference")
     func restartEventUsesHexId() async throws {
         let snapshot = Self.snapshot(nativeId: "sockt-evtid-native")
