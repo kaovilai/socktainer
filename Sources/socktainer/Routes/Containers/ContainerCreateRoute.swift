@@ -683,6 +683,13 @@ extension ContainerCreateRoute {
                             createdAnonymousVolumes.append(volume.name)
                         }
 
+                        // A bind-backed volume is shared from its host directory over virtiofs,
+                        // like a bind mount, so several running containers can mount it at once.
+                        if let bindMount = try ContainerCreateRoute.bindVolumeMount(volume, destination: parsed.destination, options: parsed.options) {
+                            resolvedMounts.append(bindMount)
+                            continue
+                        }
+
                         // Strip /lost+found when PGDATA is set (any value) — that
                         // reliably signals a Postgres container, and named volumes are
                         // always mounted at their root so /lost+found is always reachable.
@@ -975,6 +982,18 @@ extension ContainerCreateRoute {
             capAdd.append("ALL")
         }
         return capAdd
+    }
+
+    /// The virtiofs share for a named volume backed by a host directory (local driver bind options),
+    /// or nil for an ordinary disk-image volume.
+    static func bindVolumeMount(_ volume: ContainerResource.VolumeConfiguration, destination: String, options: [String]) throws -> Filesystem? {
+        guard let bind = LocalBindVolume(options: volume.options) else { return nil }
+        do {
+            try bind.checkDeviceExists(volumeName: volume.name)
+        } catch {
+            throw Abort(.badRequest, reason: "\(error)")
+        }
+        return .virtiofs(source: bind.device, destination: destination, options: bind.mountOptions(adding: options))
     }
 
     /// Mirrors moby's daemon_unix.go cpu subsystem checks (v28.5.2): NanoCpus and the CFS

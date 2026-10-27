@@ -129,11 +129,12 @@ struct ClientVolumeService: ClientVolumeProtocol {
         return Self.convert(result)
     }
 
-    private static func convert(_ v: ContainerResource.VolumeConfiguration) -> Volume {
+    static func convert(_ v: ContainerResource.VolumeConfiguration) -> Volume {
         Volume(
             Name: v.name,
             Driver: v.driver,
-            Mountpoint: v.source,
+            // A bind-backed volume's data lives in its host directory, not in the disk image.
+            Mountpoint: LocalBindVolume(options: v.options)?.device ?? v.source,
             CreatedAt: ISO8601DateFormatter().string(from: v.creationDate),
             Status: nil,  // we have no mechanism to report status for the time being
             Labels: LabelNormalization.restore(v.labels),
