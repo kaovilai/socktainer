@@ -76,7 +76,7 @@ struct ContainerRenameRouteTests {
         arguments: [
             (ClientContainerError.notFound(id: "web-1"), HTTPStatus.notFound),
             (ClientContainerError.nameConflict("db-1"), HTTPStatus.conflict),
-            (ClientContainerError.renameRequiresUnstarted(id: "web-1"), HTTPStatus.conflict),
+            (ClientContainerError.renameRequiresStopped(id: "web-1"), HTTPStatus.conflict),
             (ClientContainerError.invalidName("bad name"), HTTPStatus.badRequest),
         ])
     func mapsErrors(failure: ClientContainerError, status: HTTPStatus) async throws {

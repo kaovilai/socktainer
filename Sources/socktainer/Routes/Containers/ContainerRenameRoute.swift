@@ -35,11 +35,10 @@ extension ContainerRenameRoute {
                 throw Abort(.badRequest, reason: "Invalid container name (\(name))")
             } catch ClientContainerError.nameConflict(let name) {
                 throw Abort(.conflict, reason: "Conflict. The container name \"/\(name)\" is already in use.")
-            } catch ClientContainerError.renameRequiresUnstarted(let containerId) {
+            } catch ClientContainerError.renameRequiresStopped(let containerId) {
                 throw Abort(
                     .conflict,
-                    reason:
-                        "Cannot rename container \(containerId): socktainer can only rename containers that have never been started"
+                    reason: "Cannot rename container \(containerId): socktainer can only rename a container that is not running"
                 )
             } catch {
                 req.logger.error("Failed to rename container \(id): \(error)")
