@@ -106,7 +106,7 @@ enum ClientContainerError: Error {
     case unsupportedCondition(ContainerWaitCondition)
     case invalidName(String)
     case nameConflict(String)
-    case renameRequiresUnstarted(id: String)
+    case renameRequiresStopped(id: String)
 }
 
 struct ClientContainerService: ClientContainerProtocol {
@@ -531,10 +531,10 @@ struct ClientContainerService: ClientContainerProtocol {
 
     /// Apple Container has no rename and identifies containers by name, so a
     /// rename rebuilds the container under the new name, the same way staged
-    /// files are applied before start. Only a container that never booted can
-    /// be rebuilt without losing anything: one that ran has a private rootfs
-    /// the rebuild would discard. That covers Compose's recreate, which renames
-    /// its freshly created replacement before starting it.
+    /// files are applied before start. A container that ran has a private rootfs
+    /// (and log) in its bundle, which the rebuild carries over; one that is
+    /// running cannot be rebuilt. A never-started one covers Compose's recreate,
+    /// which renames its freshly created replacement before starting it.
     func rename(id: String, newName: String) async throws {
         let newId = ContainerNameUtility.sanitize(newName)
         guard ManagedContainer.nameValid(newId) else {
@@ -549,13 +549,8 @@ struct ClientContainerService: ClientContainerProtocol {
             if try await self.getContainerWithoutPreparationWait(id: newId)?.id == newId {
                 throw ClientContainerError.nameConflict(newId)
             }
-            let rootfs = AppleContainerTimestampResolver.appSupportURL
-                .appendingPathComponent("containers").appendingPathComponent(oldId)
-                .appendingPathComponent("rootfs.ext4")
-            guard container.status == .stopped, container.startedDate == nil,
-                !FileManager.default.fileExists(atPath: rootfs.path)
-            else {
-                throw ClientContainerError.renameRequiresUnstarted(id: oldId)
+            guard container.status == .stopped else {
+                throw ClientContainerError.renameRequiresStopped(id: oldId)
             }
 
             // Keep the Docker id: clients hold it across the rename (Compose starts by it).
@@ -568,31 +563,60 @@ struct ClientContainerService: ClientContainerProtocol {
             {
                 original.labels[timestampLabel] = String(created.timeIntervalSince1970)
             }
+            // The rebuilt container has not booted, so without this it would read as created.
+            if let started = container.lastStartedDate {
+                original.labels[ContainerSnapshot.startedAtLabel] = String(started.timeIntervalSince1970)
+            }
             let restore = original
             var configuration = original
             configuration.id = newId
             configuration.labels[DockerContainerID.idSeedLabel] = original.labels[DockerContainerID.idSeedLabel] ?? oldId
             let renamed = configuration
 
+            let bundles = AppleContainerTimestampResolver.appSupportURL.appendingPathComponent("containers")
+            let oldBundle = bundles.appendingPathComponent(oldId)
+            let newBundle = bundles.appendingPathComponent(newId)
             let kernel = try await ClientKernel.getDefaultKernel(for: .current)
             let options = await PreStartInjectionStore.shared.createOptions(containerId: oldId)
-            try await self.containerClient.withClient { try await $0.delete(id: oldId, force: true) }
+            let carried = try RenameCarryOver.stage(
+                from: oldBundle,
+                into: AppleContainerTimestampResolver.appSupportURL.appendingPathComponent("socktainer-rename")
+                    .appendingPathComponent(UUID().uuidString))
+            do {
+                try await self.containerClient.withClient { try await $0.delete(id: oldId, force: true) }
+            } catch {
+                try? carried?.land(in: oldBundle)
+                throw error
+            }
             do {
                 try await self.containerClient.withClient {
-                    try await $0.create(configuration: renamed, options: options, kernel: kernel)
+                    try await $0.create(
+                        configuration: renamed, options: carried?.createOptions(autoRemove: options.autoRemove, bundle: newBundle) ?? options,
+                        kernel: kernel)
                 }
+                try carried?.land(in: newBundle)
             } catch {
                 // Put the original back so a failed rename does not lose the container.
                 do {
+                    try? await self.containerClient.withClient { try await $0.delete(id: newId, force: true) }
                     try await self.containerClient.withClient {
-                        try await $0.create(configuration: restore, options: options, kernel: kernel)
+                        try await $0.create(
+                            configuration: restore,
+                            options: carried?.createOptions(autoRemove: options.autoRemove, bundle: oldBundle) ?? options,
+                            kernel: kernel)
                     }
+                    try carried?.land(in: oldBundle)
                 } catch {
                     throw ClientContainerError.notFound(id: oldId)
                 }
                 throw error
             }
             try await PreStartInjectionStore.shared.move(from: oldId, to: newId)
+            // Exit codes are kept by name.
+            if let code = await ContainerExitCodeStore.shared.get(id: oldId) {
+                await ContainerExitCodeStore.shared.set(id: newId, code: code)
+                await ContainerExitCodeStore.shared.remove(id: oldId)
+            }
         }
     }
 

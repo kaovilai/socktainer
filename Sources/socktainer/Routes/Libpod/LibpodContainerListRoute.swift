@@ -11,7 +11,7 @@ struct LibpodContainerListRoute: RouteCollection {
             for container in try await client.list(showAll: true, filters: [:]) {
                 // The snapshot's start date can be absent for a container that has been running
                 // a long time; fall back to its creation date rather than reporting the epoch.
-                let started = container.startedDate ?? AppleContainerTimestampResolver.containerCreationDate(container)
+                let started = container.lastStartedDate ?? AppleContainerTimestampResolver.containerCreationDate(container)
                 if let started { startedAt[DockerContainerID.hexId(for: container)] = started.timeIntervalSince1970 }
             }
             return LibpodSchema.containerList(body, startedAt: startedAt)
