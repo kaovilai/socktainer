@@ -59,16 +59,10 @@ extension ContainerRestartRoute {
             // exit would find the previous run's claim held and go unreported.
             let runEpoch = await DieEventOwnership.shared.beginRestartedRun(id: snapshot?.id ?? id)
 
-            // The stopped run's exit code is recorded by a background waiter that can trail the
-            // restart by a moment; give it a short, bounded chance so `die` carries it.
-            var exitCode: Int32? = nil
-            if wasRunning {
-                for _ in 0..<20 {
-                    exitCode = await ContainerExitCodeStore.shared.get(id: snapshot?.id ?? id, recordedAfter: exitGeneration)
-                    if exitCode != nil { break }
-                    try? await Task.sleep(nanoseconds: 50_000_000)
-                }
-            }
+            // A code is only known if the stopped run's exit was recorded by now. Apple's init
+            // process `wait()` follows the container, not the run, so its waiter usually resolves
+            // with the *next* run's exit; the `die` then goes without an exit code.
+            let exitCode = await ContainerExitCodeStore.shared.get(id: snapshot?.id ?? id, recordedAfter: exitGeneration)
             for event in Self.completionEvents(id: id, snapshot: snapshot, wasRunning: wasRunning, exitCode: exitCode) {
                 await broadcaster.broadcast(event)
             }
