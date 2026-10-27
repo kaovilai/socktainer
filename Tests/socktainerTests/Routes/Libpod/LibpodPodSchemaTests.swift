@@ -147,4 +147,39 @@ struct LibpodPodSchemaTests {
         let inspect = LibpodSchema.containerInspect(["Name": "/a", "Config": ["Labels": [LibpodPodSchema.podLabel: podID]]]) as? [String: Any]
         #expect(inspect?["Pod"] as? String == podID)
     }
+
+    @Test("stats sizes follow go-units: decimal HumanSize and binary BytesSize, four significant digits")
+    func statsSizes() {
+        #expect(LibpodPodSchema.humanSize(0) == "0B")
+        #expect(LibpodPodSchema.humanSize(999) == "999B")
+        #expect(LibpodPodSchema.humanSize(1_000) == "1kB")
+        #expect(LibpodPodSchema.humanSize(12_500_000) == "12.5MB")
+        #expect(LibpodPodSchema.humanSize(1_073_741_824) == "1.074GB")
+        #expect(LibpodPodSchema.bytesSize(1_024) == "1KiB")
+        #expect(LibpodPodSchema.bytesSize(12_500_000) == "11.92MiB")
+        #expect(LibpodPodSchema.combinedSizes(0, 0, size: LibpodPodSchema.humanSize) == "-- / --")
+        #expect(LibpodPodSchema.combinedSizes(0, 5, size: LibpodPodSchema.humanSize) == "0B / 5B")
+    }
+
+    @Test("member stats read podman's ContainerStats, summing every network")
+    func memberStatsFromPodmanStats() {
+        let stats = LibpodPodMemberStats(podmanStats: [
+            "CPU": 2.5, "MemUsage": 100, "MemLimit": 400, "MemPerc": 25.0, "BlockInput": 7, "BlockOutput": 9, "PIDs": 4,
+            "Network": ["eth0": ["RxBytes": 10, "TxBytes": 20], "eth1": ["RxBytes": 1, "TxBytes": 2]],
+        ])
+        #expect(
+            stats
+                == LibpodPodMemberStats(
+                    cpuPercent: 2.5, memUsage: 100, memLimit: 400, memPercent: 25, netInput: 11, netOutput: 22, blockInput: 7,
+                    blockOutput: 9, pids: 4))
+        let report = LibpodPodSchema.statsReport(
+            pod: PodRecord(
+                id: String(repeating: "a", count: 64), name: "p", created: Date(), labels: [:], hostname: "", network: nil,
+                ownsNetwork: false, sharedNamespaces: []),
+            member: LibpodPodMember(id: String(repeating: "b", count: 64), name: "m", state: "running", podID: "p"),
+            stats: LibpodPodMemberStats())
+        #expect(report["PIDS"] as? String == "--")
+        #expect(report["CPU"] as? String == "0.00%")
+        #expect(report["Pod"] as? String == String(repeating: "a", count: 12))
+    }
 }

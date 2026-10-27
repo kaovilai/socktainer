@@ -1,4 +1,5 @@
 import Foundation
+import NIOCore
 import Vapor
 
 /// What a pod does to one of its members.
@@ -8,6 +9,8 @@ enum LibpodPodAction: Sendable, Equatable {
     case restart(timeout: Int?)
     case kill(signal: String)
     case remove(force: Bool)
+    case pause
+    case unpause
 }
 
 /// The container-side effects the pod routes need, kept separate from the routes so the
@@ -21,14 +24,29 @@ struct LibpodPodRuntime: Sendable {
     var ensureNetwork: @Sendable (Request, PodRecord) async throws -> Void
     /// Removes the pod's network (only called for networks socktainer created).
     var removeNetwork: @Sendable (Request, String) async throws -> Void
+    /// `podman top` on one running container (by ID), with podman's raw `ps_args`.
+    var top: @Sendable (Request, String, String?) async throws -> RESTContainerTop = { _, id, _ in
+        throw Abort(.notImplemented, reason: "top is not available for \(id)")
+    }
+    /// One resource-usage sample of a running container (by ID).
+    var stats: @Sendable (Request, String) async throws -> LibpodPodMemberStats = { _, id in
+        throw Abort(.notImplemented, reason: "stats are not available for \(id)")
+    }
 }
 
 extension LibpodPodRuntime {
     /// The real runtime: member operations go through the Docker-compat handlers, so a pod
     /// start/stop/remove behaves exactly like the per-container calls (events, DNS,
     /// healthchecks, auto-remove).
-    static func live(client: ClientContainerProtocol, networkClient: ClientNetworkProtocol) -> LibpodPodRuntime {
-        LibpodPodRuntime(
+    static func live(
+        client: ClientContainerProtocol, networkClient: ClientNetworkProtocol,
+        runner: ClientContainerCommandRunner = ClientContainerCommandRunnerService(), pauser: ContainerPauseService? = nil
+    ) -> LibpodPodRuntime {
+        // Pause state is process-wide (`ContainerPauseState.shared`), so any pauser over the runner will do.
+        let pauser = pauser ?? ContainerPauseService(runner: runner)
+        let statsRoute = ContainerStatsRoute(client: client)
+        let dockerStats = ContainerStatsRoute.handler(client: client, sample: statsRoute.sample, sampleInterval: statsRoute.sampleInterval)
+        return LibpodPodRuntime(
             members: { req in
                 let sub = subrequest(
                     of: req, path: "/containers/json", id: nil,
@@ -61,6 +79,14 @@ extension LibpodPodRuntime {
                 case .remove(let force):
                     _ = try await ContainerDeleteRoute.handler(client: client)(
                         subrequest(of: req, path: "/containers/\(id)", id: id, query: ["force": force ? "true" : "false"]))
+                case .pause, .unpause:
+                    let pause = action == .pause
+                    let path = "/containers/\(id)/\(pause ? "pause" : "unpause")"
+                    let response = try await ContainerPauseRoute.handler(client: client, pauser: pauser, pause: pause)(
+                        subrequest(of: req, path: path, id: id))
+                    guard (200..<300).contains(Int(response.status.code)) else {
+                        throw Abort(response.status, reason: response.body.string ?? "\(pause ? "pause" : "unpause") failed")
+                    }
                 }
             },
             ensureNetwork: { req, pod in
@@ -79,6 +105,18 @@ extension LibpodPodRuntime {
             removeNetwork: { req, network in
                 // Through the Docker-compat handler, which first removes the network's DNS sidecar.
                 _ = try await NetworkDeleteRoute(client: networkClient).handler(subrequest(of: req, path: "/networks/\(network)", id: network))
+            },
+            top: { req, id, psArgs in
+                let query = psArgs.map { ["ps_args": $0] } ?? [:]
+                return try await LibpodContainerTopRoute.handler(client: client, runner: runner)(
+                    subrequest(of: req, path: "/containers/\(id)/top", id: id, query: query))
+            },
+            stats: { req, id in
+                let response = try await dockerStats(subrequest(of: req, path: "/containers/\(id)/stats", id: id, query: ["stream": "false"]))
+                guard let body = await LibpodAdapter.jsonBody(of: response, on: req) as? [String: Any] else {
+                    throw Abort(.internalServerError, reason: "no stats for \(id): is the container running?")
+                }
+                return LibpodPodMemberStats(podmanStats: LibpodSchema.containerStats(body, containerID: id))
             }
         )
     }
@@ -119,6 +157,10 @@ struct LibpodPodRoute: RouteCollection {
         try routes.registerVersionedRoute(.POST, pattern: "/libpod/pods/{name}/restart", use: Self.restart(store: store, runtime: runtime))
         try routes.registerVersionedRoute(.POST, pattern: "/libpod/pods/{name}/kill", use: Self.kill(store: store, runtime: runtime))
         try routes.registerVersionedRoute(.DELETE, pattern: "/libpod/pods/{name}", use: Self.remove(store: store, runtime: runtime))
+        try routes.registerVersionedRoute(.POST, pattern: "/libpod/pods/{name}/pause", use: Self.pause(store: store, runtime: runtime))
+        try routes.registerVersionedRoute(.POST, pattern: "/libpod/pods/{name}/unpause", use: Self.unpause(store: store, runtime: runtime))
+        try routes.registerVersionedRoute(.GET, pattern: "/libpod/pods/{name}/top", use: Self.top(store: store, runtime: runtime))
+        try routes.registerVersionedRoute(.GET, pattern: "/libpod/pods/stats", use: Self.stats(store: store, runtime: runtime))
     }
 
     // MARK: Helpers
@@ -341,6 +383,121 @@ struct LibpodPodRoute: RouteCollection {
                 }
             }
             return try LibpodAdapter.jsonResponse(reports)
+        }
+    }
+
+    /// Pauses every running member. Members that are not running are skipped, as podman skips
+    /// containers in a state that cannot be paused.
+    static func pause(store: PodStore, runtime: LibpodPodRuntime) -> @Sendable (Request) async throws -> Response {
+        { req in
+            let pod = try await lookup(req, store: store)
+            let running = try await members(of: pod, req, runtime: runtime).filter { $0.state == "running" }
+            let errors = await apply(.pause, to: running, req, runtime: runtime)
+            return try report(pod, errors: errors.map { "pausing container \($0)" })
+        }
+    }
+
+    /// Unpauses every paused member; the others are left alone.
+    static func unpause(store: PodStore, runtime: LibpodPodRuntime) -> @Sendable (Request) async throws -> Response {
+        { req in
+            let pod = try await lookup(req, store: store)
+            let paused = try await members(of: pod, req, runtime: runtime).filter { $0.state == "paused" }
+            let errors = await apply(.unpause, to: paused, req, runtime: runtime)
+            return try report(pod, errors: errors.map { "unpausing container \($0)" })
+        }
+    }
+
+    /// `podman pod top`: the processes of every running member in one table. podman's pod top
+    /// only takes format descriptors (`user,pid,args`), never raw `ps` options.
+    static func top(store: PodStore, runtime: LibpodPodRuntime) -> @Sendable (Request) async throws -> Response {
+        { req in
+            if let raw = req.query[String.self, at: "delay"] {
+                guard let delay = Int(raw) else {
+                    throw Abort(.badRequest, reason: "failed to parse parameters for \(req.url.string): delay: invalid value \(raw)")
+                }
+                guard delay >= 1 else { throw Abort(.badRequest, reason: "\"delay\" parameter of value \(delay) < 1") }
+            }
+            let pod = try await lookup(req, store: store)
+            let psArgs = allQueryValues(named: "ps_args", from: req.url.query)
+            let descriptors = ContainerTop.libpodDescriptors(psArgs)
+            guard let plan = ContainerTop.libpodPlan(descriptors: descriptors) else {
+                let unknown = descriptors.first { ContainerTop.descriptors[$0] == nil } ?? descriptors.joined(separator: ",")
+                throw Abort(.internalServerError, reason: "'\(unknown)': unknown descriptor")
+            }
+            let titles = plan.descriptors.map { ContainerTop.descriptors[$0]?.title ?? $0.uppercased() }
+            let joined = psArgs.isEmpty ? nil : psArgs.joined(separator: ",")
+            var processes: [[String]] = []
+            for member in try await members(of: pod, req, runtime: runtime) where member.state == "running" {
+                do {
+                    processes += try await runtime.top(req, member.id, joined).Processes
+                } catch let abort as AbortError where abort.status == .conflict || abort.status == .notFound {
+                    // The member stopped or went away since the listing: it has no processes.
+                }
+            }
+            return try LibpodAdapter.jsonResponse(["Titles": titles, "Processes": processes])
+        }
+    }
+
+    /// `podman pod stats`: one `PodStatsReport` per running or paused member of the pods asked
+    /// for, or of every pod with `all` (or with neither, as podman's v1 compatibility does).
+    static func stats(store: PodStore, runtime: LibpodPodRuntime) -> @Sendable (Request) async throws -> Response {
+        { req in
+            let names = allQueryValues(named: "namesOrIDs", from: req.url.query).filter { !$0.isEmpty }
+            let all = req.query[Bool.self, at: "all"] ?? false
+            let stream = req.query[Bool.self, at: "stream"] ?? false
+            let delay = req.query[Int.self, at: "delay"] ?? 5
+            if all && !names.isEmpty {
+                throw Abort(.internalServerError, reason: "--all, --latest and arguments cannot be used together")
+            }
+            var pods: [PodRecord] = []
+            if names.isEmpty {
+                pods = await store.all()
+            } else {
+                for name in names {
+                    guard let pod = await store.resolve(name) else {
+                        throw Abort(.notFound, reason: "unable to get list of pods: no pod with name or ID \(name) found: no such pod")
+                    }
+                    pods.append(pod)
+                }
+            }
+            let requested = pods
+
+            @Sendable func sample() async throws -> ByteBuffer {
+                let everyone = try await runtime.members(req)
+                var reports: [[String: Any]] = []
+                for pod in requested {
+                    for member in everyone where member.podID == pod.id && ["running", "paused"].contains(member.state) {
+                        let usage: LibpodPodMemberStats
+                        do {
+                            usage = try await runtime.stats(req, member.id)
+                        } catch let abort as AbortError where abort.status == .conflict || abort.status == .notFound {
+                            continue  // stopped or removed since the listing, as podman skips stopped members
+                        }
+                        reports.append(LibpodPodSchema.statsReport(pod: pod, member: member, stats: usage))
+                    }
+                }
+                var buffer = ByteBuffer(data: try JSONSerialization.data(withJSONObject: reports))
+                buffer.writeString("\n")
+                return buffer
+            }
+
+            let first = try await sample()
+            let response = Response(status: .ok)
+            response.headers.contentType = .json
+            guard stream else {
+                response.body = .init(buffer: first)
+                return response
+            }
+            let interval = max(delay, 1)
+            response.body = .init(asyncStream: { writer in
+                try await writer.write(.buffer(first))
+                while !Task.isCancelled {
+                    try await Task.sleep(for: .seconds(interval))
+                    do { try await writer.write(.buffer(try await sample())) } catch { break }
+                }
+                try await writer.write(.end)
+            })
+            return response
         }
     }
 }

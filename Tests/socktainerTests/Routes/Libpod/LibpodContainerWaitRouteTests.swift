@@ -83,15 +83,53 @@ struct LibpodContainerWaitRouteTests {
         }
     }
 
-    @Test("condition=stopping is still 501, not a misleading 400 'invalid condition'")
-    func stoppingConditionIsNotImplemented() async throws {
-        let client = RecordingWaitClient()
+    @Test("condition=stopping answers -1 while Apple Container reports the container stopping")
+    func stoppingConditionAnswersMinusOne() async throws {
+        let client = RecordingWaitClient(snapshot: makeSnapshot(status: .stopping))
         try await withWaitRoute(client) { app in
             try await app.testing().test(.POST, "/v1.51/libpod/containers/ctr/wait?condition=stopping") { res async throws in
-                #expect(res.status == .notImplemented)
+                #expect(res.status == .ok)
+                #expect(String(buffer: res.body).trimmingCharacters(in: .whitespacesAndNewlines) == "-1")
             }
         }
         #expect(await client.receivedCondition == nil)
+    }
+
+    @Test("condition=stopping counts a stop that happened between two polls")
+    func stoppingConditionCatchesMissedTransition() async throws {
+        let client = RecordingWaitClient(snapshot: makeSnapshot(status: .running))
+        try await withApp(configure: { _ in }) { app in
+            let probe = Task {
+                await LibpodContainerWaitRoute.stateReached([.stopping], nativeId: "ctr", client: client, app: app, intervalNs: 10_000_000)
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+            await client.setSnapshot(makeSnapshot(status: .stopped))
+            #expect(await probe.value == -1)
+        }
+    }
+
+    @Test("condition=stopping keeps waiting on a container that was already stopped, as podman does")
+    func stoppingConditionWaitsOnStoppedContainer() async throws {
+        let client = RecordingWaitClient(snapshot: makeSnapshot(status: .stopped))
+        try await withApp(configure: { _ in }) { app in
+            let probe = Task {
+                await LibpodContainerWaitRoute.stateReached([.stopping], nativeId: "ctr", client: client, app: app, intervalNs: 10_000_000)
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+            probe.cancel()
+            #expect(await probe.value == nil)
+        }
+    }
+
+    @Test("condition=unknown answers -1 once Apple Container reports the container's status as unknown")
+    func unknownStatusConditionAnswersMinusOne() async throws {
+        let client = RecordingWaitClient(snapshot: makeSnapshot(status: .unknown))
+        try await withWaitRoute(client) { app in
+            try await app.testing().test(.POST, "/v1.51/libpod/containers/ctr/wait?condition=unknown") { res async throws in
+                #expect(res.status == .ok)
+                #expect(String(buffer: res.body).trimmingCharacters(in: .whitespacesAndNewlines) == "-1")
+            }
+        }
     }
 
     @Test("condition=created answers -1 at once for a container that never started, as podman does for a state")
@@ -161,13 +199,15 @@ struct LibpodContainerWaitRouteTests {
 
 private actor RecordingWaitClient: ClientContainerProtocol {
     private(set) var receivedCondition: ContainerWaitCondition?
-    private let snapshot: ContainerSnapshot
+    private var snapshot: ContainerSnapshot
     private let exitCode: Int64
 
     init(snapshot: ContainerSnapshot = makeSnapshot(status: .stopped), exitCode: Int64 = 0) {
         self.snapshot = snapshot
         self.exitCode = exitCode
     }
+
+    func setSnapshot(_ snapshot: ContainerSnapshot) { self.snapshot = snapshot }
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { [] }
     func getContainer(id: String) async throws -> ContainerSnapshot? { snapshot }
