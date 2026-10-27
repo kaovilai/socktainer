@@ -359,7 +359,8 @@ struct ExecRoute: RouteCollection {
             }
 
             let detach = startRequest.Detach ?? false
-            let tty = startRequest.Tty ?? config.tty
+            let tty = ExecRoute.startTty(
+                requested: startRequest.Tty, configured: config.tty, sessionTty: req.storage[ExecStartUsesSessionTtyKey.self] == true)
             // Docker sends ConsoleSize as [height, width] for interactive (-it) exec.
             // Apply it as the initial PTY winsize right after start so `stty size` and TUIs
             // (vim/htop/less) work, rather than relying solely on the async /exec/{id}/resize
@@ -875,6 +876,12 @@ struct ExecRoute: RouteCollection {
             return 127
         }
         return -1
+    }
+
+    /// Whether an exec start runs on a pty. Docker's start body may set `Tty`; podman's start
+    /// keeps the terminal setting the exec was created with (`sessionTty`).
+    static func startTty(requested: Bool?, configured: Bool, sessionTty: Bool) -> Bool {
+        sessionTty ? configured : (requested ?? configured)
     }
 
     /// Maps Docker's exec-start `ConsoleSize` to an initial terminal size.
