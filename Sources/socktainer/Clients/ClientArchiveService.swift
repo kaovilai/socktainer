@@ -2,6 +2,7 @@ import ContainerAPIClient
 import ContainerResource
 import ContainerizationArchive
 import ContainerizationEXT4
+import ContainerizationOCI
 import Foundation
 import SystemPackage
 import Vapor
@@ -1343,8 +1344,12 @@ extension ClientArchiveService: ClientContainerChangesProtocol {
     /// deletions.
     func exportChangeLayer(container: ContainerSnapshot) async throws -> CommitChangeLayer? {
         let rootfsPath = getRootfsPath(containerId: container.id)
-        guard FileManager.default.fileExists(atPath: rootfsPath.path),
-            let snapshotPath = imageSnapshotPath(containerId: container.id),
+        guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
+            // A container that never started has no rootfs of its own and so no changes: moby
+            // commits it as the image's layers plus an empty layer.
+            return try await emptyChangeLayer(container: container)
+        }
+        guard let snapshotPath = imageSnapshotPath(containerId: container.id),
             let manifestDigest = Self.manifestDigest(ofSnapshot: snapshotPath)
         else {
             return nil
@@ -1372,6 +1377,41 @@ extension ClientArchiveService: ClientContainerChangesProtocol {
             throw ClientArchiveError.operationFailed(message: "failed to build the change layer of \(container.id): \(error)")
         }
         return CommitChangeLayer(tarPath: layerPath, baseManifestDigest: manifestDigest)
+    }
+
+    /// An empty change layer over the platform manifest of the container's image, or nil when
+    /// that manifest is not in the content store.
+    private func emptyChangeLayer(container: ContainerSnapshot) async throws -> CommitChangeLayer? {
+        let image = container.configuration.image.descriptor
+        let content = try LocalContentStore(path: appSupportPath.appendingPathComponent("content"))
+        guard let blob = try await content.get(digest: image.digest) else { return nil }
+        let platform = container.configuration.platform
+        guard
+            let manifestDigest = Self.platformManifestDigest(
+                descriptorDigest: image.digest, blob: try blob.data(), architecture: platform.architecture, os: platform.os,
+                variant: platform.variant)
+        else { return nil }
+        let layerPath = FileManager.default.temporaryDirectory.appendingPathComponent("commit-layer-\(UUID().uuidString).tar")
+        try ImageLayerChanges.writeChangeLayer(changes: [], fullRootfsTar: URL(fileURLWithPath: "/dev/null"), to: layerPath)
+        return CommitChangeLayer(tarPath: layerPath, baseManifestDigest: manifestDigest)
+    }
+
+    /// The platform manifest an image descriptor resolves to: the descriptor itself when it is a
+    /// manifest, else the index entry for `architecture`/`os` (and `variant`, when both name one).
+    static func platformManifestDigest(descriptorDigest: String, blob: Data, architecture: String, os: String, variant: String?) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: blob) as? [String: Any] else { return nil }
+        guard let manifests = object["manifests"] as? [[String: Any]] else {
+            return object["layers"] != nil ? descriptorDigest : nil
+        }
+        let matching = manifests.filter { entry in
+            guard let entryPlatform = entry["platform"] as? [String: Any] else { return false }
+            return entryPlatform["architecture"] as? String == architecture && entryPlatform["os"] as? String == os
+        }
+        let exact = matching.first { entry in
+            guard let variant, let entryVariant = (entry["platform"] as? [String: Any])?["variant"] as? String else { return true }
+            return entryVariant == variant
+        }
+        return (exact ?? matching.first)?["digest"] as? String
     }
 
     /// `.../snapshots/<hex>/snapshot` → `sha256:<hex>`.
