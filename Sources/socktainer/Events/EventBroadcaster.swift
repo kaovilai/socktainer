@@ -54,7 +54,8 @@ extension DockerEvent {
             from: attributes["image"] ?? "",
             Type: type,
             Action: action,
-            Actor: DockerActor(ID: actorID, Attributes: attributes),
+            // Container labels ride in the attributes; socktainer's bookkeeping labels are not the client's.
+            Actor: DockerActor(ID: actorID, Attributes: LabelNormalization.withoutInternal(attributes)),
             scope: "local",
             time: timeSeconds,
             timeNano: timeNano

@@ -1,3 +1,4 @@
+import ContainerResource
 import Foundation
 import Logging
 
@@ -90,6 +91,39 @@ enum LabelNormalization {
     /// Create routes must reject such inputs to prevent silent data loss.
     static func containsReservedKey(_ labels: [String: String]) -> Bool {
         labels[mappingKey] != nil
+    }
+
+    // MARK: - Internal container labels
+
+    /// Container labels socktainer writes for its own bookkeeping — values Apple Container has
+    /// no field for (Docker's command split, port bindings, restart policy, healthcheck, DNS
+    /// aliases, bind-backed volumes, ...). The client never set them, so Docker responses and
+    /// label filters must not expose them. Opt-in labels a user sets on purpose (for example
+    /// `socktainer.rewrite-loopback`) and the pod membership label podman reads back stay visible.
+    static let internalContainerLabelKeys: Set<String> = [
+        mappingKey,
+        HealthCheckManager.healthcheckLabel,
+        RestartPolicyManager.label,
+        ContainerCreateRoute.portBindingsLabel,
+        ContainerCreateRoute.commandLabel,
+        "socktainer.dns.names",
+        ExtraHostsFile.label,
+        LocalBindVolume.containerLabel,
+        ContainerStdinRegistry.openStdinLabel,
+        ContainerAnonymousVolumes.label,
+        DockerContainerID.idSeedLabel,
+        AppleContainerTimestampResolver.legacyCreationTimestampLabel,
+        ContainerSnapshot.startedAtLabel,
+    ]
+
+    /// `labels` without socktainer's internal bookkeeping labels (keys stay as stored).
+    static func withoutInternal(_ labels: [String: String]) -> [String: String] {
+        labels.filter { !internalContainerLabelKeys.contains($0.key) }
+    }
+
+    /// A container's labels as the client set them: original keys restored, internal labels removed.
+    static func userContainerLabels(_ labels: [String: String]) -> [String: String] {
+        withoutInternal(restore(labels))
     }
 
     // MARK: - Mapping: build and restore
