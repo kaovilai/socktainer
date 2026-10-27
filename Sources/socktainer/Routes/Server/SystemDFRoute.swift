@@ -352,7 +352,7 @@ extension SystemDFRoute {
             Ports: ports,
             SizeRw: size,
             SizeRootFs: size,
-            Labels: LabelNormalization.restore(container.configuration.labels),
+            Labels: LabelNormalization.userContainerLabels(container.configuration.labels),
             State: container.mobyState,
             Status: container.mobyState,
             HostConfig: ContainerHostConfig(NetworkMode: networkMode, Annotations: nil),

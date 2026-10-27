@@ -135,7 +135,7 @@ extension ContainerInspectRoute {
                 MacAddress: nil,  // no mechanism to derive this value
                 OnBuild: nil,  // no mechanism to derive this value
                 Labels: {
-                    let restored = LabelNormalization.restore(container.configuration.labels)
+                    let restored = LabelNormalization.userContainerLabels(container.configuration.labels)
                     return restored.isEmpty ? nil : restored
                 }(),
                 StopSignal: container.configuration.stopSignal,

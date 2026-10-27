@@ -227,7 +227,7 @@ struct ClientContainerService: ClientContainerProtocol {
                 }
             case "label":
                 result = result.filter { container in
-                    let labels = container.configuration.labels
+                    let labels = LabelNormalization.withoutInternal(container.configuration.labels)
                     return values.allSatisfy { labelFilter in
                         guard let eqIdx = labelFilter.firstIndex(of: "=") else {
                             return LabelNormalization.filterContainsKey(labelFilter, in: labels)
@@ -781,7 +781,7 @@ struct ClientContainerService: ClientContainerProtocol {
                 }
             case "label":
                 containersToDelete = containersToDelete.filter { container in
-                    let labels = container.configuration.labels
+                    let labels = LabelNormalization.withoutInternal(container.configuration.labels)
                     return values.allSatisfy { labelFilter in
                         if labelFilter.contains("!=") {
                             if let eqIdx = labelFilter.range(of: "!=") {
