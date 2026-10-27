@@ -235,6 +235,7 @@ func configure(_ app: Application) async throws {
         try app.register(collection: LibpodContainersStatsRoute(client: containerClient))
         try app.register(collection: LibpodContainerPauseRoute())
         try app.register(collection: LibpodContainerUnpauseRoute())
+        try app.register(collection: LibpodContainerHealthcheckRoute(client: containerClient))
         try app.register(collection: LibpodContainerChangesRoute())
         try app.register(collection: LibpodContainerPruneRoute(dockerRoute: ContainerPruneRoute(client: containerClient)))
         try app.register(collection: LibpodContainerUpdateRoute(client: containerClient))
