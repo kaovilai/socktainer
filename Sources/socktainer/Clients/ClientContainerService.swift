@@ -159,6 +159,12 @@ struct ClientContainerService: ClientContainerProtocol {
         snapshot.configuration.labels[NetworkDNSManager.roleLabel] == NetworkDNSManager.dnsRole
     }
 
+    /// The container a `before`/`since` value names: Docker takes an exact name or an ID prefix,
+    /// never a name prefix (`since=web` must not pick `web-2`).
+    static func filterReference(_ reference: String, in pool: [ContainerSnapshot]) -> ContainerSnapshot? {
+        pool.first { $0.id == reference } ?? pool.first { DockerContainerID.hexId(for: $0).hasPrefix(reference) }
+    }
+
     /// Applies parsed Docker container filters to a snapshot list.
     /// `allContainers` is the unfiltered set used by `before`/`since` for
     /// relative ordering; defaults to `containers` when not available.
@@ -212,10 +218,7 @@ struct ClientContainerService: ClientContainerProtocol {
             case "before":
                 result = result.filter { container in
                     for beforeId in values {
-                        if let beforeContainer = referencePool.first(where: {
-                            $0.id == beforeId || $0.id.hasPrefix(beforeId)
-                                || DockerContainerID.hexId(for: $0).hasPrefix(beforeId)
-                        }) {
+                        if let beforeContainer = filterReference(beforeId, in: referencePool) {
                             if let beforeTimestamp = AppleContainerTimestampResolver.containerCreationDate(beforeContainer),
                                 let containerTimestamp = AppleContainerTimestampResolver.containerCreationDate(container)
                             {
@@ -229,10 +232,7 @@ struct ClientContainerService: ClientContainerProtocol {
             case "since":
                 result = result.filter { container in
                     for sinceId in values {
-                        if let sinceContainer = referencePool.first(where: {
-                            $0.id == sinceId || $0.id.hasPrefix(sinceId)
-                                || DockerContainerID.hexId(for: $0).hasPrefix(sinceId)
-                        }) {
+                        if let sinceContainer = filterReference(sinceId, in: referencePool) {
                             if let sinceTimestamp = AppleContainerTimestampResolver.containerCreationDate(sinceContainer),
                                 let containerTimestamp = AppleContainerTimestampResolver.containerCreationDate(container)
                             {

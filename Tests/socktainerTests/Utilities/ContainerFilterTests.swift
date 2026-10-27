@@ -321,6 +321,19 @@ struct ContainerFilterTests {
         #expect(result.map(\.id) == ["bbb", "ccc"])
     }
 
+    @Test("since= names a container exactly, not by name prefix")
+    func sinceFilterExactName() throws {
+        // `web` must resolve to itself even when `web-2` is listed first.
+        let containers = [
+            try makeSnapshot(id: "web-2"),
+            try makeSnapshot(id: "web"),
+            try makeSnapshot(id: "zzz"),
+        ]
+        let result = ClientContainerService.applyFilters(
+            containers, filters: ["since": ["web"]], allContainers: containers)
+        #expect(result.map(\.id) == ["web-2", "zzz"])
+    }
+
     // MARK: - remaining filter keys (behavioural smoke tests)
 
     @Test("name filter keeps containers matching by native id")
