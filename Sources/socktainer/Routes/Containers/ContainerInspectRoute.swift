@@ -97,7 +97,8 @@ extension ContainerInspectRoute {
                 ?? RestartPolicy(Name: "no", MaximumRetryCount: nil)
 
             let containerConfig: ContainerConfig = ContainerConfig(
-                Hostname: container.id,  // Use container ID as hostname since hostName property doesn't exist
+                // The create route stores the requested hostname on the network attachment.
+                Hostname: container.configuration.networks.first?.options.hostname ?? container.id,
                 Domainname: container.configuration.dns?.domain,
                 User: getUserString(from: container.configuration.initProcess.user),
                 AttachStdin: false,  // no mechanism to derive this value
@@ -167,7 +168,9 @@ extension ContainerInspectRoute {
                 }
             let hostConfig = HostConfig(
                 restartPolicy: restartPolicy,
-                portBindings: Self.hostConfigPortBindings(labels: container.configuration.labels, published: publishedPorts)
+                portBindings: Self.hostConfigPortBindings(labels: container.configuration.labels, published: publishedPorts),
+                // The attached network (configured, so a never-started container has one too), else Docker's default.
+                networkMode: container.configuration.networks.first?.network ?? "default"
             )
 
             // Enhanced network settings with proper port mapping

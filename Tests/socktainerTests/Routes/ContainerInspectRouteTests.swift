@@ -79,6 +79,35 @@ struct ContainerInspectRouteNetworkSettingsTests {
         }
     }
 
+    @Test("inspect reports the hostname the create route stored and the configured network as NetworkMode")
+    func hostnameAndNetworkMode() async throws {
+        let container = makeSnapshot(
+            id: "c-host",
+            status: .stopped,
+            configuredNetworks: [AttachmentConfiguration(network: "mynet", options: AttachmentOptions(hostname: "my-host"))],
+            liveNetworks: []
+        )
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/c-host/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.Config.Hostname == "my-host")
+                #expect(inspect.HostConfig.NetworkMode == "mynet")
+            }
+        }
+    }
+
+    @Test("a container with no configured network reports Docker's default network mode")
+    func defaultNetworkMode() async throws {
+        let container = makeSnapshot(id: "c-nonet", status: .stopped, configuredNetworks: [], liveNetworks: [])
+        try await withRoute(container: container) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/c-nonet/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.HostConfig.NetworkMode == "default")
+                #expect(inspect.Config.Hostname == "c-nonet")
+            }
+        }
+    }
+
     @Test("A stopped container still reports its configured network attachment")
     func stoppedContainerReportsConfiguredNetwork() async throws {
         let container = makeSnapshot(
