@@ -42,6 +42,45 @@ struct CommitRouteTests {
         #expect(await archive.exportedIds() == ["web"])
     }
 
+    @Test("a commit broadcasts moby's container commit event with the comment, image id and reference")
+    func broadcastsCommitEvent() async throws {
+        let broadcaster = EventBroadcaster()
+        let stream = await broadcaster.stream()
+        let capture = Task<DockerEvent?, Never> {
+            for await event in stream where event.Action == "commit" { return event }
+            return nil
+        }
+        let snapshot = try makeContainerSnapshot(nativeId: "web", ip: "192.168.65.2", network: "bridge", labels: [:], status: .running)
+        try await withCommitApp(
+            snapshot: snapshot, archive: CommitArchiveClient(), images: RecordingCommitClient(baseConfig: #"{"config":{}}"#),
+            broadcaster: broadcaster
+        ) { app in
+            try await app.testing().test(.POST, "/v1.51/commit?container=web&repo=io-committed&comment=snap") { res async in
+                #expect(res.status == .created)
+            }
+        }
+        let timeout = Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            capture.cancel()
+        }
+        let event = await capture.value
+        timeout.cancel()
+        #expect(event?.Type == "container")
+        #expect(event?.Actor.Attributes["name"] == "web")
+        #expect(event?.Actor.Attributes["comment"] == "snap")
+        #expect(event?.Actor.Attributes["imageID"] == "sha256:committed")
+        #expect(event?.Actor.Attributes["imageRef"] == "io-committed:latest")
+        #expect(event.flatMap(LibpodEventTranslation.translate)?.Action == "commit")
+    }
+
+    @Test("an untagged commit's event has an empty imageRef")
+    func untaggedCommitEvent() throws {
+        let snapshot = try makeContainerSnapshot(nativeId: "web", ip: "192.168.65.2", network: "bridge", labels: [:])
+        let event = CommitRoute.commitEvent(container: snapshot, imageId: "sha256:x", repo: nil, tag: nil, comment: nil)
+        #expect(event.Actor.Attributes["imageRef"] == "")
+        #expect(event.Actor.Attributes["comment"] == "")
+    }
+
     @Test("a body config overrides the container's command")
     func bodyConfigOverrides() async throws {
         let images = RecordingCommitClient(baseConfig: #"{"config":{"Cmd":["/bin/sh"]}}"#)
@@ -134,10 +173,12 @@ private func withCommitApp(
     archive: CommitArchiveClient,
     images: RecordingCommitClient,
     libpod: Bool = false,
+    broadcaster: EventBroadcaster? = nil,
     test: @escaping (Application) async throws -> Void
 ) async throws {
     let client: ClientContainerProtocol = snapshot.map { StaticSnapshotClientMock(snapshot: $0) } ?? NoContainerClient()
     try await withApp(configure: { _ in }) { app in
+        if let broadcaster { app.storage[EventBroadcasterKey.self] = broadcaster }
         let regexRouter = app.regexRouter(with: app.logger)
         app.setRegexRouter(regexRouter)
         regexRouter.installMiddleware(on: app)

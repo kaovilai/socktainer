@@ -143,11 +143,14 @@ struct CommitRoute: RouteCollection {
         }
         defer { try? FileManager.default.removeItem(at: tarPath) }
 
+        let repo = commit.repo?.isEmpty == false ? commit.repo : nil
+        let tag = commit.tag?.isEmpty == false ? commit.tag : nil
+        let digest: String
         do {
-            let (_, digest) = try await imageClient.commitImage(
+            (_, digest) = try await imageClient.commitImage(
                 tarPath: tarPath,
-                repo: commit.repo?.isEmpty == false ? commit.repo : nil,
-                tag: commit.tag?.isEmpty == false ? commit.tag : nil,
+                repo: repo,
+                tag: tag,
                 comment: commit.comment,
                 author: commit.author,
                 configJSON: configJSON,
@@ -155,10 +158,24 @@ struct CommitRoute: RouteCollection {
                 appleContainerAppSupportUrl: appSupport,
                 logger: req.logger
             )
-            return digest
         } catch ClientImageError.digestReferenceNotAllowed(let repo) {
             throw Abort(.badRequest, reason: "cannot commit to \(repo): a digest reference is not a valid target")
         }
+
+        if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+            await broadcaster.broadcast(commitEvent(container: container, imageId: digest, repo: repo, tag: tag, comment: commit.comment))
+        }
+        return digest
+    }
+
+    /// moby's container `commit` event: the comment, the new image's id, and the reference it
+    /// was tagged with (empty for an untagged commit). podman logs a `commit` too.
+    static func commitEvent(container: ContainerSnapshot, imageId: String, repo: String?, tag: String?, comment: String?) -> DockerEvent {
+        let imageRef = repo.map { "\($0):\(tag ?? "latest")" } ?? ""
+        return DockerEvent.containerEvent(
+            "commit", container: container,
+            extraAttributes: ["comment": comment ?? "", "imageID": imageId, "imageRef": imageRef]
+        )
     }
 
     /// The user the container runs as, unless it is the root default Apple records for a

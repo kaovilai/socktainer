@@ -10,11 +10,19 @@ import VaporTesting
 private actor RenameMock: ClientContainerProtocol {
     let failure: ClientContainerError?
     private(set) var calls: [(id: String, newName: String)] = []
+    /// The container's current name, when lookups should find it; renames update it.
+    private var currentName: String?
 
-    init(failure: ClientContainerError? = nil) { self.failure = failure }
+    init(failure: ClientContainerError? = nil, existing: String? = nil) {
+        self.failure = failure
+        self.currentName = existing
+    }
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] { [] }
-    func getContainer(id: String) async throws -> ContainerSnapshot? { nil }
+    func getContainer(id: String) async throws -> ContainerSnapshot? {
+        guard let currentName, id == currentName else { return nil }
+        return try makeContainerSnapshot(nativeId: currentName, ip: "192.168.64.2", network: "default", labels: [:])
+    }
     nonisolated func enforceContainerRunning(container: ContainerSnapshot) throws {}
     func start(id: String, detachKeys: String?) async throws {}
     func stop(id: String, signal: String?, timeout: Int?) async throws {}
@@ -24,6 +32,7 @@ private actor RenameMock: ClientContainerProtocol {
     func rename(id: String, newName: String) async throws {
         calls.append((id, newName))
         if let failure { throw failure }
+        currentName = newName
     }
     func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait {
         RESTContainerWait(statusCode: 0)
@@ -33,8 +42,11 @@ private actor RenameMock: ClientContainerProtocol {
     }
 }
 
-private func withRenameApp(_ mock: RenameMock, _ body: (Application) async throws -> Void) async throws {
+private func withRenameApp(
+    _ mock: RenameMock, broadcaster: EventBroadcaster? = nil, _ body: (Application) async throws -> Void
+) async throws {
     try await withApp(configure: { _ in }) { app in
+        if let broadcaster { app.storage[EventBroadcasterKey.self] = broadcaster }
         let regexRouter = app.regexRouter(with: app.logger)
         app.setRegexRouter(regexRouter)
         regexRouter.installMiddleware(on: app)
@@ -85,5 +97,48 @@ struct ContainerRenameRouteTests {
                 #expect(res.status == status)
             }
         }
+    }
+
+    @Test("A rename broadcasts moby's rename event: the new name, and oldName with its leading slash")
+    func broadcastsRenameEvent() async throws {
+        let broadcaster = EventBroadcaster()
+        let stream = await broadcaster.stream()
+        let capture = Task<DockerEvent?, Never> {
+            for await event in stream where event.Action == "rename" { return event }
+            return nil
+        }
+        try await withRenameApp(RenameMock(existing: "old-web"), broadcaster: broadcaster) { app in
+            try await app.testing().test(.POST, "/v1.51/containers/old-web/rename?name=new-web") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+        let timeout = Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            capture.cancel()
+        }
+        let event = await capture.value
+        timeout.cancel()
+        #expect(event?.Type == "container")
+        #expect(event?.Actor.Attributes["name"] == "new-web")
+        #expect(event?.Actor.Attributes["oldName"] == "/old-web")
+        #expect(event.flatMap(LibpodEventTranslation.translate)?.Action == "rename")
+    }
+
+    @Test("A failed rename broadcasts nothing")
+    func failedRenameBroadcastsNothing() async throws {
+        let broadcaster = EventBroadcaster()
+        let stream = await broadcaster.stream()
+        let capture = Task<DockerEvent?, Never> {
+            for await event in stream { return event }
+            return nil
+        }
+        try await withRenameApp(RenameMock(failure: .nameConflict("db-1"), existing: "web-1"), broadcaster: broadcaster) { app in
+            try await app.testing().test(.POST, "/v1.51/containers/web-1/rename?name=db-1") { res async in
+                #expect(res.status == .conflict)
+            }
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        capture.cancel()
+        #expect(await capture.value == nil)
     }
 }

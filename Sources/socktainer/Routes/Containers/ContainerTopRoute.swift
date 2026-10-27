@@ -21,7 +21,12 @@ extension ContainerTopRoute {
             let container = try await runningContainer(req, client: client)
             let command = ContainerTop.dockerCommand(psArgs: query.ps_args)
             let output = try await runPS(command, in: container, runner: runner, logger: req.logger)
-            return try parse { try ContainerTop.parseDockerOutput(output, command: command) }
+            let top = try parse { try ContainerTop.parseDockerOutput(output, command: command) }
+            // moby logs a `top` event for every successful top; podman has no such event.
+            if let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                await broadcaster.broadcast(DockerEvent.containerEvent("top", container: container))
+            }
+            return top
         }
     }
 

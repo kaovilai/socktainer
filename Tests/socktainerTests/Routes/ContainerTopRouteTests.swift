@@ -30,7 +30,8 @@ final class CannedCommandRunner: ClientContainerCommandRunner, @unchecked Sendab
 }
 
 private func withTopApp(
-    status: RuntimeStatus = .running, runner: CannedCommandRunner, _ body: (Application) async throws -> Void
+    status: RuntimeStatus = .running, runner: CannedCommandRunner, broadcaster: EventBroadcaster? = nil,
+    _ body: (Application) async throws -> Void
 ) async throws {
     let snapshot = try makeContainerSnapshot(nativeId: "web", ip: "192.168.64.2", network: "default", labels: [:], status: status)
     let client = StaticSnapshotClientMock(snapshot: snapshot)
@@ -39,6 +40,7 @@ private func withTopApp(
         app.setRegexRouter(regexRouter)
         regexRouter.installMiddleware(on: app)
         app.middleware.use(ErrorMiddleware.default(environment: app.environment))
+        if let broadcaster { app.storage[EventBroadcasterKey.self] = broadcaster }
         try app.register(collection: ContainerTopRoute(client: client, runner: runner))
         try app.register(collection: LibpodContainerTopRoute(client: client, runner: runner))
         try await body(app)
@@ -134,6 +136,30 @@ struct ContainerTopRouteTests {
             }
         }
         #expect(runner.commands == [["ps", "-ef"]])
+    }
+
+    @Test("docker top logs moby's top event, which podman's event stream drops")
+    func dockerTopEvent() async throws {
+        let broadcaster = EventBroadcaster()
+        let stream = await broadcaster.stream()
+        let capture = Task<DockerEvent?, Never> {
+            for await event in stream where event.Action == "top" { return event }
+            return nil
+        }
+        try await withTopApp(runner: CannedCommandRunner(stdout: busyboxPSEF), broadcaster: broadcaster) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/web/top") { res async in
+                #expect(res.status == .ok)
+            }
+        }
+        let timeout = Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            capture.cancel()
+        }
+        let event = await capture.value
+        timeout.cancel()
+        #expect(event?.Type == "container")
+        #expect(event?.Actor.Attributes["name"] == "web")
+        #expect(event.flatMap(LibpodEventTranslation.translate) == nil)
     }
 
     @Test("docker top passes ps_args through")
