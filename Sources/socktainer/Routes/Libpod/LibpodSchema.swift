@@ -333,6 +333,28 @@ enum LibpodSchema {
         ] as [String: Any]
     }
 
+    /// podman sends `since`/`until` as typed: a Unix time, an RFC3339 time, or a Go duration meaning
+    /// "that long ago" (`30s`, `1h30m`). Docker's CLI turns durations into times client-side, so
+    /// the Docker-compat events route only reads times; this converts a duration to Unix seconds
+    /// and leaves anything else for it to parse.
+    static func absoluteEventTime(_ value: String, now: Date = Date()) -> String? {
+        let units: [String: Double] = ["ns": 1e-9, "us": 1e-6, "\u{00B5}s": 1e-6, "ms": 1e-3, "s": 1, "m": 60, "h": 3600]
+        var remaining = Substring(value)
+        var seconds = 0.0
+        var parsedAny = false
+        while !remaining.isEmpty {
+            let number = remaining.prefix { $0.isNumber || $0 == "." }
+            guard !number.isEmpty, let amount = Double(number) else { return nil }
+            remaining = remaining.dropFirst(number.count)
+            guard let unit = units.keys.sorted(by: { $0.count > $1.count }).first(where: { remaining.hasPrefix($0) }) else { return nil }
+            remaining = remaining.dropFirst(unit.count)
+            seconds += amount * (units[unit] ?? 0)
+            parsedAny = true
+        }
+        guard parsedAny else { return nil }
+        return String(Int(now.timeIntervalSince1970 - seconds))
+    }
+
     // MARK: Prune
 
     /// `podman volume prune` removes every unused volume; Docker-compat's prune only removes
