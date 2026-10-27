@@ -27,7 +27,13 @@ extension ContainerListRoute {
             let showAll = (query.all ?? false) || limit > 0
 
             let parsedFilters = try DockerContainerFilterUtility.parseContainerFilters(filtersParam: query.filters, logger: req.logger)
-            let containers = try await client.list(showAll: showAll, filters: parsedFilters)
+            let containers: [ContainerSnapshot]
+            do {
+                containers = try await client.list(showAll: showAll, filters: parsedFilters)
+            } catch ClientContainerError.notFound(let reference) {
+                // A `before`/`since` filter naming no container.
+                throw Abort(.notFound, reason: "No such container: \(reference)")
+            }
 
             // Apply health filter here using the real HealthCheckManager state.
             // ClientContainerService skips the health filter to avoid a stale heuristic.

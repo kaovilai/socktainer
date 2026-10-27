@@ -114,7 +114,22 @@ struct ClientContainerService: ClientContainerProtocol {
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] {
         let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
+        if let missing = Self.unresolvedOrderingReference(in: filters, among: allContainers) {
+            throw ClientContainerError.notFound(id: missing)
+        }
         return Self.listing(allContainers, showAll: showAll, filters: filters)
+    }
+
+    /// The first `before`/`since` filter value that names no container. Docker resolves
+    /// these references before filtering and fails the listing with "No such container"
+    /// rather than answering an empty list.
+    static func unresolvedOrderingReference(in filters: [String: [String]], among containers: [ContainerSnapshot]) -> String? {
+        for key in ["before", "since"] {
+            for reference in filters[key] ?? [] where filterReference(reference, in: containers) == nil {
+                return reference
+            }
+        }
+        return nil
     }
 
     /// The `list(showAll:filters:)` result for `allContainers`, DNS sidecars already removed.
