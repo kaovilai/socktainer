@@ -3,9 +3,10 @@ import Vapor
 
 struct ContainerDeleteRoute: RouteCollection {
     let client: ClientContainerProtocol
+    var pauseState: ContainerPauseState = .shared
     func boot(routes: RoutesBuilder) throws {
         try routes.registerVersionedRoute(
-            .DELETE, pattern: "/containers/{id}", use: ContainerDeleteRoute.handler(client: client))
+            .DELETE, pattern: "/containers/{id}", use: ContainerDeleteRoute.handler(client: client, pauseState: pauseState))
     }
 
 }
@@ -18,6 +19,7 @@ struct ContainerDeleteQuery: Content {
 extension ContainerDeleteRoute {
     static func handler(
         client: ClientContainerProtocol,
+        pauseState: ContainerPauseState = .shared,
         removeVolumes: @escaping @Sendable ([String], Logger) async -> Void = { names, logger in
             await ContainerAnonymousVolumes.remove(names: names, logger: logger)
         }
@@ -66,7 +68,13 @@ extension ContainerDeleteRoute {
                 // Docker Engine API: removing a running container requires force=true.
                 // Checked before any side effect (healthcheck stop, DNS cleanup) so a
                 // rejected delete leaves the container fully intact. A container still
-                // shutting down (.stopping) counts as running, as it does in moby.
+                // shutting down (.stopping) counts as running, as it does in moby, and a paused
+                // one must be unpaused (or force-removed) first.
+                if let container, pauseState.isPaused(container), !force {
+                    throw Abort(
+                        .conflict,
+                        reason: "cannot remove container \"\(id)\": container is paused and must be unpaused first")
+                }
                 if let container, container.status == .running || container.status == .stopping, !force {
                     throw Abort(
                         .conflict,
@@ -99,6 +107,9 @@ extension ContainerDeleteRoute {
                     try await client.stop(id: id, signal: nil, timeout: nil)
                 }
                 try await client.delete(id: id)
+                // A force-removed paused container is gone; its paused entry goes with it rather
+                // than lingering until the next startup reconcile.
+                if let container { pauseState.markUnpaused(id: container.id) }
                 if query.v == true {
                     await removeVolumes(
                         ContainerAnonymousVolumes.names(labels: container?.configuration.labels ?? eventLabels), req.logger)
