@@ -39,6 +39,7 @@ func configure(_ app: Application) async throws {
     await RestartPolicyOverrideStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
     await PreStartInjectionStore.shared.configure(storageDirectory: appleContainerAppSupportUrl, logger: app.logger)
     await PodStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
+    ContainerPauseState.shared.configure(storageDirectory: appleContainerAppSupportUrl)
     let imageClient = ClientImageService(containerSystemConfig: systemConfig)
     let healthCheckClient = ClientHealthCheckService()
     let networkClient = ClientNetworkService()
@@ -357,6 +358,12 @@ func configure(_ app: Application) async throws {
     let housekeepingFinished = await StartupHousekeeping.runBounded(timeout: .seconds(30)) {
         await dnsManager.adoptOrRemoveSidecarsFromPreviousRun()
         await OrphanedNetworkReaper.reap(networkClient: ClientNetworkService(), logger: housekeepingLogger)
+        // Forget pauses of containers that stopped or restarted while socktainer was down.
+        if !ContainerPauseState.shared.recordedIDs.isEmpty,
+            let containers = try? await containerClient.list(showAll: true, filters: [:])
+        {
+            ContainerPauseState.shared.reconcile(with: containers)
+        }
     }
     if !housekeepingFinished {
         app.logger.warning(

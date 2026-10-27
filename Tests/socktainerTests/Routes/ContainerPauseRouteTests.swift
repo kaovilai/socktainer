@@ -88,6 +88,43 @@ struct ContainerPauseServiceTests {
         #expect(!state.isPaused(try runningSnapshot("web", startedAt: Date(timeIntervalSince1970: 2_000))))
     }
 
+    @Test("Paused containers survive a daemon restart through the state file")
+    func persistedAcrossRestart() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("pause-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent(ContainerPauseState.fileName)
+
+        let web = try runningSnapshot("web", startedAt: Date(timeIntervalSince1970: 1_700_000_000.123456))
+        let db = try runningSnapshot("db")
+        let before = ContainerPauseState(fileURL: url)
+        before.markPaused(web)
+        before.markPaused(db)
+        before.markUnpaused(id: "db")
+
+        let after = ContainerPauseState()
+        after.configure(storageDirectory: directory)
+        #expect(after.isPaused(web))
+        #expect(!after.isPaused(db))
+        #expect(after.recordedIDs == ["web"])
+    }
+
+    @Test("Reconciling after a restart drops containers that are gone, stopped or restarted")
+    func reconcile() throws {
+        let state = ContainerPauseState()
+        let kept = try runningSnapshot("kept")
+        let restarted = try runningSnapshot("restarted")
+        var stopped = try runningSnapshot("stopped")
+        for container in [kept, restarted, stopped, try runningSnapshot("gone")] {
+            state.markPaused(container)
+        }
+        stopped.status = .stopped
+        state.reconcile(with: [kept, stopped, try runningSnapshot("restarted", startedAt: Date(timeIntervalSince1970: 5_000))])
+        #expect(state.recordedIDs == ["kept"])
+        #expect(state.isPaused(kept))
+        #expect(!state.isPaused(restarted))
+    }
+
     @Test("A paused container's Docker state is paused")
     func mobyState() throws {
         let container = try runningSnapshot("pause-moby-state-test")
