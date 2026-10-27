@@ -179,7 +179,7 @@ func configure(_ app: Application) async throws {
 
     // --- miscellaneous ---
     try app.register(collection: AuthRoute(client: registryClient))
-    try app.register(collection: CommitRoute())
+    try app.register(collection: CommitRoute(containerClient: containerClient, archiveClient: archiveClient, imageClient: imageClient))
     let systemDFRoute = SystemDFRoute(
         imageClient: imageClient, containerClient: containerClient, volumeClient: volumeClient, builderClient: builderClient,
         diskUsageProvider: ContainerClientDiskUsageProvider(),
@@ -251,7 +251,7 @@ func configure(_ app: Application) async throws {
         try app.register(collection: LibpodImageImportRoute(client: imageClient))
         try app.register(collection: LibpodImageSearchRoute(dockerRoute: ImageSearchRoute()))
         try app.register(collection: LibpodImageHistoryRoute(systemConfig: systemConfig))
-        try app.register(collection: LibpodCommitRoute())
+        try app.register(collection: LibpodCommitRoute(containerClient: containerClient, archiveClient: archiveClient, imageClient: imageClient))
         try app.register(collection: LibpodContainerExistsRoute(client: containerClient))
         try app.register(collection: LibpodImageExistsRoute(systemConfig: systemConfig))
         try app.register(collection: LibpodVolumeExistsRoute(client: volumeClient))
