@@ -166,6 +166,91 @@ enum VolumeCopyUp {
         return String(data: data, encoding: .utf8)
     }
 
+    // MARK: - Bind-backed volumes
+
+    /// True when the host directory backing a bind-backed volume has no entries. moby copies
+    /// image content only into an empty volume.
+    static func isEmpty(hostDirectory: String) -> Bool {
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: hostDirectory) else { return false }
+        return entries.isEmpty
+    }
+
+    /// Copies what the image holds at `sourcePath` into the host directory backing a bind-backed
+    /// volume, keeping modes, symlinks and hard links. Ownership is left to the host user: the
+    /// directory is the user's own and is shared into the VM as is.
+    static func populate(
+        hostDirectory: String,
+        fromRootfs rootfsPath: String,
+        sourcePath: String,
+        logger: Logger
+    ) throws {
+        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath))
+        let source = FilePath(sourcePath.hasPrefix("/") ? sourcePath : "/\(sourcePath)")
+        guard reader.exists(source, followSymlinks: true) else { return }
+        let (_, rootInode) = try reader.stat(source)
+        guard rootInode.isDirectory else { return }
+
+        var linked: [EXT4.InodeNumber: String] = [:]
+        try copyChildren(of: source, from: reader, intoHost: hostDirectory, linked: &linked, logger: logger)
+        try FileManager.default.setAttributes([.posixPermissions: Int(rootInode.mode & 0o7777)], ofItemAtPath: hostDirectory)
+    }
+
+    private static func copyChildren(
+        of source: FilePath,
+        from reader: EXT4.EXT4Reader,
+        intoHost target: String,
+        linked: inout [EXT4.InodeNumber: String],
+        logger: Logger
+    ) throws {
+        let fileManager = FileManager.default
+        for name in try reader.listDirectory(source) where name != "." && name != ".." {
+            let child = source.join(name)
+            let childTarget = (target as NSString).appendingPathComponent(name)
+            let (inodeNumber, inode) = try reader.stat(child, followSymlinks: false)
+
+            if !inode.isDirectory, inode.linksCount > 1, let first = linked[inodeNumber] {
+                try fileManager.linkItem(atPath: first, toPath: childTarget)
+                continue
+            }
+
+            if inode.isDirectory {
+                try fileManager.createDirectory(atPath: childTarget, withIntermediateDirectories: false)
+                try copyChildren(of: child, from: reader, intoHost: childTarget, linked: &linked, logger: logger)
+                try fileManager.setAttributes([.posixPermissions: Int(inode.mode & 0o7777)], ofItemAtPath: childTarget)
+            } else if inode.isSymlink {
+                guard let link = symlinkTarget(of: inode, at: child, from: reader) else {
+                    logger.warning("[volume-copyup] unreadable symlink skipped: \(child)")
+                    continue
+                }
+                try fileManager.createSymbolicLink(atPath: childTarget, withDestinationPath: link)
+            } else if inode.isRegularFile {
+                guard fileManager.createFile(atPath: childTarget, contents: nil) else {
+                    throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: childTarget])
+                }
+                let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: childTarget))
+                defer { try? handle.close() }
+                let size = UInt64(inode.size)
+                var offset: UInt64 = 0
+                var buffer = [UInt8](repeating: 0, count: 1 << 20)
+                while offset < size {
+                    let want = Int(min(UInt64(buffer.count), size - offset))
+                    let read = try buffer.withUnsafeMutableBytes { raw in
+                        try reader.readFile(
+                            at: child, into: UnsafeMutableRawBufferPointer(rebasing: raw[0..<want]), offset: offset, followSymlinks: false)
+                    }
+                    guard read > 0 else { break }
+                    try handle.write(contentsOf: buffer[0..<read])
+                    offset += UInt64(read)
+                }
+                try fileManager.setAttributes([.posixPermissions: Int(inode.mode & 0o7777)], ofItemAtPath: childTarget)
+            } else {
+                logger.warning("[volume-copyup] unsupported file type not copied: \(child)")
+                continue
+            }
+            if inode.linksCount > 1 { linked[inodeNumber] = childTarget }
+        }
+    }
+
     private static func timestamps(of inode: EXT4.Inode) -> FileTimestamps {
         // ext4 keeps creation time in crtime; ctime is the inode's own change
         // time and would be the wrong answer here. An image that never recorded

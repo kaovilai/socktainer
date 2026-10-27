@@ -529,6 +529,8 @@ extension ContainerCreateRoute {
             // Named volumes worth a copy-up, collected here and populated once the
             // container exists: the image's contents are only reachable from it.
             var copyUpCandidates: [(source: String, destination: String)] = []
+            // Bind-backed volumes get the same copy-up into their (empty) host directory.
+            var bindCopyUpCandidates: [(source: String, destination: String)] = []
             var bindVolumeNames: [String: String] = [:]
 
             // Docker creates missing bind-mount source directories on the host automatically.
@@ -689,6 +691,9 @@ extension ContainerCreateRoute {
                         if let bindMount = try ContainerCreateRoute.bindVolumeMount(volume, destination: parsed.destination, options: parsed.options) {
                             resolvedMounts.append(bindMount)
                             bindVolumeNames[parsed.destination] = volume.name
+                            if !parsed.options.contains("nocopy") {
+                                bindCopyUpCandidates.append((source: bindMount.source, destination: parsed.destination))
+                            }
                             continue
                         }
 
@@ -802,6 +807,7 @@ extension ContainerCreateRoute {
                     container = try await containerClient.get(id: containerConfiguration.id)
                     req.logger.debug("Container created successfully with ID: \(container.id)")
                     ContainerCreateRoute.populateEmptyVolumes(copyUpCandidates, for: container, logger: req.logger)
+                    ContainerCreateRoute.populateEmptyBindVolumes(bindCopyUpCandidates, for: container, logger: req.logger)
                 } catch {
                     req.logger.error("Failed to create container: \(error)")
                     throw Abort(.internalServerError, reason: "Failed to create container: \(error)")
@@ -937,6 +943,24 @@ extension ContainerCreateRoute {
     /// the container exists, which is when the image's filesystem can be read, and
     /// always before it starts. Best-effort: a volume that cannot be prepared is
     /// left as it was rather than failing the creation.
+    static func populateEmptyBindVolumes(
+        _ candidates: [(source: String, destination: String)],
+        for container: ContainerSnapshot,
+        appSupport: URL = URL(fileURLWithPath: "\(NSHomeDirectory())/Library/Application Support/com.apple.container"),
+        logger: Logger
+    ) {
+        guard !candidates.isEmpty,
+            let rootfs = VolumeCopyUp.imageFilesystem(containerId: container.id, appSupportPath: appSupport)
+        else { return }
+        for candidate in candidates where VolumeCopyUp.isEmpty(hostDirectory: candidate.source) {
+            do {
+                try VolumeCopyUp.populate(hostDirectory: candidate.source, fromRootfs: rootfs.path, sourcePath: candidate.destination, logger: logger)
+            } catch {
+                logger.warning("[volume-copyup] \(candidate.destination) left partly copied: \(error)")
+            }
+        }
+    }
+
     static func populateEmptyVolumes(
         _ candidates: [(source: String, destination: String)],
         for container: ContainerSnapshot,
