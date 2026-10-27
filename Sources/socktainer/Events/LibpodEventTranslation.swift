@@ -58,13 +58,22 @@ enum LibpodEventTranslation {
             attributes["name"] = event.Actor.ID
         }
 
+        // moby's network events are about the network (Actor.ID = network id, `container`
+        // and `name` attributes); podman's are about the container (libpod
+        // `newNetworkEvent`: ID = container id, `network` = network name).
+        var actorID = event.Actor.ID
+        if event.Type == "network", let container = attributes["container"] {
+            actorID = container
+            attributes = ["network": attributes["name"] ?? event.Actor.ID]
+        }
+
         var translated = DockerEvent(
             status: action,
             id: event.id,
             from: event.from,
             Type: event.Type,
             Action: action,
-            Actor: DockerActor(ID: event.Actor.ID, Attributes: attributes),
+            Actor: DockerActor(ID: actorID, Attributes: attributes),
             scope: event.scope,
             time: event.time,
             timeNano: event.timeNano

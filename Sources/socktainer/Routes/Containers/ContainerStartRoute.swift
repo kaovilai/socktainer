@@ -112,6 +112,8 @@ extension ContainerStartRoute {
             // before the "start" event (daemon/volumes_unix.go). Same pragmatism as the
             // ungated "start" below: a redundant /start re-emits them.
             if let snap = metadataSnapshot {
+                // moby connects networks (one "connect" per network) before setting up mounts.
+                await NetworkAttachEvents.broadcastConnects(for: snap, containerId: eventId, broadcaster: broadcaster, logger: req.logger)
                 await VolumeMountEvents.broadcastMounts(for: snap, containerId: eventId, broadcaster: broadcaster)
             }
 
@@ -204,6 +206,8 @@ extension ContainerStartRoute {
             // Container resolves to nil and skips its unmount events.
             let exitSnapshot = try? await client.getContainer(id: nativeId)
             if let exitSnapshot {
+                // daemon.Cleanup releases the networks ("disconnect") before unmounting volumes.
+                await NetworkAttachEvents.broadcastDisconnects(for: exitSnapshot, containerId: eventId, broadcaster: broadcaster, logger: logger)
                 await VolumeMountEvents.broadcastUnmounts(for: exitSnapshot, containerId: eventId, broadcaster: broadcaster)
             }
 
