@@ -26,20 +26,24 @@ struct ContainerResizeRoute: RouteCollection {
                 throw Abort(.notFound, reason: "No such container: \(containerId)")
             }
 
-            if let process = await ProcessRegistry.shared.get(id: container.id) {
-                let size = Terminal.Size(width: UInt16(min(w, Int(UInt16.max))), height: UInt16(min(h, Int(UInt16.max))))
-                // moby emits "resize" only after the task resize succeeded, carrying the
-                // requested height/width as decimal strings (daemon/resize.go). Exec resize
-                // stays silent — moby logs no event there.
-                if (try? await process.resize(size)) != nil,
-                    let broadcaster = req.application.storage[EventBroadcasterKey.self]
-                {
-                    await broadcaster.broadcast(
-                        DockerEvent.containerEvent(
-                            "resize", container: container,
-                            extraAttributes: ["height": String(h), "width": String(w)]
-                        ))
-                }
+            let size = Terminal.Size(width: UInt16(min(w, Int(UInt16.max))), height: UInt16(min(h, Int(UInt16.max))))
+            guard let process = await ProcessRegistry.shared.get(id: container.id) else {
+                // Not started yet (podman resizes `run -it` before it starts the container):
+                // apply the size once the process exists.
+                await ProcessRegistry.shared.setPendingSize(id: container.id, size: size)
+                return Response(status: .ok)
+            }
+            // moby emits "resize" only after the task resize succeeded, carrying the
+            // requested height/width as decimal strings (daemon/resize.go). Exec resize
+            // stays silent — moby logs no event there.
+            if (try? await process.resize(size)) != nil,
+                let broadcaster = req.application.storage[EventBroadcasterKey.self]
+            {
+                await broadcaster.broadcast(
+                    DockerEvent.containerEvent(
+                        "resize", container: container,
+                        extraAttributes: ["height": String(h), "width": String(w)]
+                    ))
             }
 
             return Response(status: .ok)

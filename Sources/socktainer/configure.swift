@@ -219,6 +219,7 @@ func configure(_ app: Application) async throws {
         try app.register(collection: LibpodExecStartRoute(client: containerClient))
         try app.register(collection: LibpodExecInspectRoute(client: containerClient))
         try app.register(collection: LibpodExecRemoveRoute())
+        try app.register(collection: LibpodResizeRoute(client: containerClient))
         try app.register(collection: LibpodVolumeListRoute(dockerRoute: VolumeListRoute(client: volumeClient)))
         try app.register(collection: LibpodVolumeCreateRoute(dockerRoute: VolumeCreateRoute(client: volumeClient)))
         try app.register(collection: LibpodVolumeDeleteRoute(dockerRoute: VolumeDeleteRoute(client: volumeClient)))
