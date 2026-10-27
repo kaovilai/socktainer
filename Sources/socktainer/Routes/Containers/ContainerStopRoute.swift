@@ -32,6 +32,15 @@ extension ContainerStopRoute {
                 return .notModified
             }
 
+            // moby's containerStop sends the stop signal through killWithSignal, which logs
+            // a "kill" event ({"signal": <int>}, SIGTERM by default) before the "die" and
+            // "stop" events.
+            if let snapshot, let broadcaster = req.application.storage[EventBroadcasterKey.self] {
+                let signalNumber = (try? parseSignal(signal ?? "SIGTERM")) ?? SIGTERM
+                await broadcaster.broadcast(
+                    DockerEvent.containerEvent("kill", container: snapshot, extraAttributes: ["signal": String(signalNumber)]))
+            }
+
             do {
                 try await client.stop(id: id, signal: signal, timeout: timeout)
             } catch ClientContainerError.notFound {

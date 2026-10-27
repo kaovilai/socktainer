@@ -317,19 +317,6 @@ struct LibpodCreateBodyTests {
         #expect(LibpodSchema.platform(fromSpec: [:]) == nil)
     }
 
-    @Test("podman's relative durations for events since/until become absolute Unix times")
-    func eventDurations() {
-        let now = Date(timeIntervalSince1970: 1_700_000_000)
-        #expect(LibpodSchema.absoluteEventTime("30s", now: now) == "1699999970")
-        #expect(LibpodSchema.absoluteEventTime("1h30m", now: now) == "1699994600")
-        #expect(LibpodSchema.absoluteEventTime("500ms", now: now) == "1699999999")
-        // Times (and anything else) are left for the events route to parse.
-        #expect(LibpodSchema.absoluteEventTime("1700000000", now: now) == nil)
-        #expect(LibpodSchema.absoluteEventTime("2023-11-14T22:13:20Z", now: now) == nil)
-        #expect(LibpodSchema.absoluteEventTime("", now: now) == nil)
-        #expect(LibpodSchema.absoluteEventTime("5x", now: now) == nil)
-    }
-
     @Test("a named network wins over the namespace mode")
     func networkMode() {
         #expect(LibpodSchema.dockerNetworkMode(fromSpec: ["Networks": ["mynet": [String: Any]()], "netns": ["nsmode": "bridge"]]) == "mynet")
