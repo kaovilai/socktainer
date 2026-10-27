@@ -170,7 +170,10 @@ extension ContainerInspectRoute {
                 restartPolicy: restartPolicy,
                 portBindings: Self.hostConfigPortBindings(labels: container.configuration.labels, published: publishedPorts),
                 // The attached network (configured, so a never-started container has one too), else Docker's default.
-                networkMode: container.configuration.networks.first?.network ?? "default"
+                networkMode: container.configuration.networks.first?.network ?? "default",
+                // `docker start -a` (and `compose run --rm`, which runs it) reads this to wait for
+                // the removal rather than the next exit, which an auto-removed container never reports.
+                autoRemove: await PreStartInjectionStore.shared.createOptions(containerId: container.id).autoRemove
             )
 
             // Enhanced network settings with proper port mapping
