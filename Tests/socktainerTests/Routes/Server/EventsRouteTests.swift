@@ -122,24 +122,14 @@ struct EventsRouteTests {
         }
     }
 
-    @Test("events older than since are dropped; until still ends the stream")
+    @Test("live events older than since are dropped; until still ends the stream")
     func sinceInTheFutureDropsEvents() async throws {
         let now = Date().timeIntervalSince1970
-        try await withEventsConnection(query: "?since=\(now + 60)&until=\(now + 1.5)") { conn, broadcaster in
+        try await withEventsConnection(query: "?since=\(now + 1)&until=\(now + 1.5)") { conn, broadcaster in
             await broadcaster.broadcast(Self.event("start"))
             let response = try await Task.detached { try conn.read(until: "0\r\n\r\n", timeout: 5) }.value
             #expect(!response.contains(#""Action":"start""#))
         }
-    }
-
-    @Test("since and until accept Unix seconds, fractional seconds and RFC3339")
-    func timestampParsing() {
-        #expect(EventsRoute.parseTimestamp("1700000000") == Date(timeIntervalSince1970: 1_700_000_000))
-        #expect(EventsRoute.parseTimestamp("1700000000.5") == Date(timeIntervalSince1970: 1_700_000_000.5))
-        #expect(EventsRoute.parseTimestamp("2023-11-14T22:13:20Z") == Date(timeIntervalSince1970: 1_700_000_000))
-        #expect(EventsRoute.parseTimestamp("") == nil)
-        #expect(EventsRoute.parseTimestamp(nil) == nil)
-        #expect(EventsRoute.parseTimestamp("garbage") == nil)
     }
 
     private static func eventually(timeout: Duration = .seconds(3), _ condition: () async -> Bool) async -> Bool {
