@@ -159,6 +159,24 @@ enum ContainerImageUtility {
         logger: Logger,
         maxExpandedLayerSize: Int = ContainerImageUtility.maxExpandedLayerSize
     ) throws -> String {
+        try buildSingleLayerOCILayout(
+            tarPath: tarPath, ociLayoutPath: ociLayoutPath, platform: platform, configDict: config.toDict(), message: message,
+            author: nil, reference: reference, logger: logger, maxExpandedLayerSize: maxExpandedLayerSize)
+    }
+
+    /// `configDict` is the image config's `config` object, as-is (`docker commit` carries
+    /// fields `SynthesizedImageConfig` does not model).
+    static func buildSingleLayerOCILayout(
+        tarPath: URL,
+        ociLayoutPath: URL,
+        platform: Platform,
+        configDict: [String: Any],
+        message: String?,
+        author: String?,
+        reference: String?,
+        logger: Logger,
+        maxExpandedLayerSize: Int = ContainerImageUtility.maxExpandedLayerSize
+    ) throws -> String {
         try rejectForeignFormat(at: tarPath)
         try validateTar(at: tarPath, maxExpandedLayerSize: maxExpandedLayerSize)
 
@@ -175,7 +193,7 @@ enum ContainerImageUtility {
             "created": createdAt,
             "architecture": platform.architecture,
             "os": platform.os,
-            "config": config.toDict(),
+            "config": configDict,
             "rootfs": [
                 "type": "layers",
                 "diff_ids": ["sha256:\(layer.diffID)"],
@@ -184,11 +202,14 @@ enum ContainerImageUtility {
                 [
                     "created": createdAt,
                     "comment": message ?? "",
-                ]
+                ].merging(author.map { ["author": $0] } ?? [:]) { _, new in new }
             ],
         ]
         if let variant = platform.variant {
             imageConfigDict["variant"] = variant
+        }
+        if let author, !author.isEmpty {
+            imageConfigDict["author"] = author
         }
 
         let configData = try JSONSerialization.data(withJSONObject: imageConfigDict, options: [])
