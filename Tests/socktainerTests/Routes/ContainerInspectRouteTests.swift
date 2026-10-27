@@ -433,6 +433,7 @@ struct ContainerInspectRouteRestartPolicyTests {
                 let inspect = try res.content.decode(RESTContainerInspect.self)
                 #expect(inspect.State.Status == "exited")
                 #expect(inspect.State.ExitCode == 7)
+                #expect(inspect.State.Dead == false, "Docker reports Dead only for a container whose removal failed")
             }
         }
         await ContainerExitCodeStore.shared.remove(id: nativeId)
