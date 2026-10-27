@@ -269,7 +269,8 @@ func configure(_ app: Application) async throws {
         try app.register(collection: LibpodManifestModifyRoute(client: manifestClient))
         try app.register(collection: LibpodManifestDeleteRoute(client: manifestClient))
         try app.register(collection: LibpodManifestPushRoute(manifestClient: manifestClient, imageClient: imageClient))
-        try app.register(collection: LibpodPodRoute(runtime: .live(client: containerClient, networkClient: networkClient)))
+        try app.register(
+            collection: LibpodPodRoute(runtime: .live(client: containerClient, networkClient: networkClient, runner: commandRunner, pauser: pauser)))
     } else {
         app.logger.notice("Podman libpod API disabled via \(LibpodSupport.disableEnvironmentVariable)")
     }
