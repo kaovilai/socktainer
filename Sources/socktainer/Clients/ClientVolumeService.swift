@@ -27,6 +27,12 @@ struct ClientVolumeService: ClientVolumeProtocol {
     }
 
     func delete(name: String) async throws {
+        // Apple's in-use check only sees disk-image mounts; a bind-backed volume is mounted as a
+        // plain virtiofs share, recorded in a container label instead.
+        let users = LocalBindVolume.containers(using: name, in: try await ContainerClient().list())
+        guard users.isEmpty else {
+            throw Abort(.conflict, reason: "remove \(name): volume is in use - [\(users.joined(separator: ", "))]")
+        }
         try await ClientVolume.delete(name: name)
     }
 
@@ -129,11 +135,12 @@ struct ClientVolumeService: ClientVolumeProtocol {
         return Self.convert(result)
     }
 
-    private static func convert(_ v: ContainerResource.VolumeConfiguration) -> Volume {
+    static func convert(_ v: ContainerResource.VolumeConfiguration) -> Volume {
         Volume(
             Name: v.name,
             Driver: v.driver,
-            Mountpoint: v.source,
+            // A bind-backed volume's data lives in its host directory, not in the disk image.
+            Mountpoint: LocalBindVolume(options: v.options)?.device ?? v.source,
             CreatedAt: ISO8601DateFormatter().string(from: v.creationDate),
             Status: nil,  // we have no mechanism to report status for the time being
             Labels: LabelNormalization.restore(v.labels),
