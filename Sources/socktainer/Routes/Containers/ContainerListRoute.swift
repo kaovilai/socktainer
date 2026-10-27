@@ -82,6 +82,7 @@ extension ContainerListRoute {
                     uniquingKeysWith: { first, _ in first }
                 )
 
+                let bindVolumeNames = LocalBindVolume.volumeNames(labels: container.configuration.labels)
                 let mounts = container.configuration.mounts.map { mount in
                     let mountType: String
                     let mountName: String?
@@ -97,9 +98,11 @@ extension ContainerListRoute {
                         mountName = name
                         driver = "local"
                     case .virtiofs:
-                        mountType = "bind"
-                        mountName = nil
-                        driver = nil
+                        // A bind-backed named volume is shared over virtiofs but is still a volume.
+                        let volumeName = bindVolumeNames[mount.destination]
+                        mountType = volumeName == nil ? "bind" : "volume"
+                        mountName = volumeName
+                        driver = volumeName == nil ? nil : "local"
                     case .tmpfs:
                         mountType = "tmpfs"
                         mountName = nil

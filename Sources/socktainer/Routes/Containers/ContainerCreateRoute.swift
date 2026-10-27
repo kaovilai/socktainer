@@ -529,6 +529,7 @@ extension ContainerCreateRoute {
             // Named volumes worth a copy-up, collected here and populated once the
             // container exists: the image's contents are only reachable from it.
             var copyUpCandidates: [(source: String, destination: String)] = []
+            var bindVolumeNames: [String: String] = [:]
 
             // Docker creates missing bind-mount source directories on the host automatically.
             // Parser.mounts() validates that the source path exists and throws if not, so we
@@ -687,6 +688,7 @@ extension ContainerCreateRoute {
                         // like a bind mount, so several running containers can mount it at once.
                         if let bindMount = try ContainerCreateRoute.bindVolumeMount(volume, destination: parsed.destination, options: parsed.options) {
                             resolvedMounts.append(bindMount)
+                            bindVolumeNames[parsed.destination] = volume.name
                             continue
                         }
 
@@ -734,6 +736,7 @@ extension ContainerCreateRoute {
 
                 // Never trust a client-supplied value: it names a directory socktainer deletes.
                 containerConfiguration.labels[ExtraHostsFile.label] = nil
+                containerConfiguration.labels[LocalBindVolume.containerLabel] = LocalBindVolume.label(volumeNames: bindVolumeNames)
                 containerConfiguration.labels[ContainerStdinRegistry.openStdinLabel] = body.OpenStdin == true ? "true" : nil
 
                 containerConfiguration.mounts = resolvedMounts

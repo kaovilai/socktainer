@@ -27,6 +27,12 @@ struct ClientVolumeService: ClientVolumeProtocol {
     }
 
     func delete(name: String) async throws {
+        // Apple's in-use check only sees disk-image mounts; a bind-backed volume is mounted as a
+        // plain virtiofs share, recorded in a container label instead.
+        let users = LocalBindVolume.containers(using: name, in: try await ContainerClient().list())
+        guard users.isEmpty else {
+            throw Abort(.conflict, reason: "remove \(name): volume is in use - [\(users.joined(separator: ", "))]")
+        }
         try await ClientVolume.delete(name: name)
     }
 

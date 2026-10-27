@@ -1,3 +1,4 @@
+import ContainerResource
 import Foundation
 
 /// A `local`-driver volume created with bind options
@@ -10,6 +11,28 @@ import Foundation
 /// number of running containers can share it. Apple still allocates a (sparse, unused) image for
 /// the volume; socktainer just never mounts it.
 struct LocalBindVolume: Equatable {
+    /// Container label mapping each bind-backed volume's mount destination to the volume name.
+    /// The mount itself is a plain virtiofs share, so without it inspect would report a bind.
+    static let containerLabel = "socktainer.bind-volumes"
+
+    /// The volume names recorded in `containerLabel`, keyed by mount destination.
+    static func volumeNames(labels: [String: String]) -> [String: String] {
+        guard let raw = labels[containerLabel], let data = raw.data(using: .utf8) else { return [:] }
+        return (try? JSONDecoder().decode([String: String].self, from: data)) ?? [:]
+    }
+
+    static func label(volumeNames: [String: String]) -> String? {
+        guard !volumeNames.isEmpty, let data = try? JSONEncoder().encode(volumeNames) else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Docker IDs of the containers that mount the bind-backed volume `name`, as moby lists them
+    /// when refusing to remove a volume in use.
+    static func containers(using name: String, in containers: [ContainerSnapshot]) -> [String] {
+        containers.filter { volumeNames(labels: $0.configuration.labels).values.contains(name) }
+            .map { DockerContainerID.hexId(for: $0) }
+    }
+
     /// The host directory backing the volume.
     let device: String
     /// Whether `o` asked for a read-only mount (`o=bind,ro`).

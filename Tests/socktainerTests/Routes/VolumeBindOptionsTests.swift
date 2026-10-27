@@ -53,6 +53,25 @@ struct VolumeBindOptionsTests {
         #expect(try ContainerCreateRoute.bindVolumeMount(plain, destination: "/data", options: []) == nil)
     }
 
+    @Test("the container label maps mount destinations back to bind-backed volume names")
+    func containerLabel() throws {
+        let label = try #require(LocalBindVolume.label(volumeNames: ["/data": "shared", "/cache": "cache"]))
+        #expect(LocalBindVolume.volumeNames(labels: [LocalBindVolume.containerLabel: label]) == ["/data": "shared", "/cache": "cache"])
+        #expect(LocalBindVolume.label(volumeNames: [:]) == nil)
+        #expect(LocalBindVolume.volumeNames(labels: [:]).isEmpty)
+        #expect(LocalBindVolume.volumeNames(labels: [LocalBindVolume.containerLabel: "not json"]).isEmpty)
+    }
+
+    @Test("containers mounting a bind-backed volume are found through their label")
+    func inUse() throws {
+        let label = try #require(LocalBindVolume.label(volumeNames: ["/data": "shared"]))
+        let user = try makeContainerSnapshot(
+            nativeId: "user", ip: "192.168.64.2", network: "default", labels: [LocalBindVolume.containerLabel: label], status: .running)
+        let other = try makeContainerSnapshot(nativeId: "other", ip: "192.168.64.3", network: "default", labels: [:], status: .running)
+        #expect(LocalBindVolume.containers(using: "shared", in: [user, other]) == [DockerContainerID.hexId(for: user)])
+        #expect(LocalBindVolume.containers(using: "unused", in: [user, other]).isEmpty)
+    }
+
     @Test("mounting a bind-backed volume whose directory is gone fails")
     func missingDevice() {
         let volume = VolumeConfiguration(
