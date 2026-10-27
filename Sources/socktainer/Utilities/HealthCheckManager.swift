@@ -45,6 +45,7 @@ actor HealthCheckManager {
     private var statuses: [String: ContainerHealth] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
     private var logs: [String: [HealthLogEntry]] = [:]  // ring buffer, max 5 entries per container
+    private var startDeadlines: [String: Date] = [:]  // end of each container's start period, until the first success
     private let log = Logger(label: "socktainer.healthcheck")
     private let probe: HealthProbe
     private let intervalFloorNs: UInt64
@@ -88,6 +89,34 @@ actor HealthCheckManager {
         tasks.removeValue(forKey: containerId)?.cancel()
         statuses.removeValue(forKey: containerId)
         logs.removeValue(forKey: containerId)
+        startDeadlines.removeValue(forKey: containerId)
+    }
+
+    /// Runs the healthcheck once now, as `podman healthcheck run` does, and records the outcome
+    /// like a scheduled probe so inspect's `State.Health` reflects it. Returns the outcome of this
+    /// run alone (`healthy`, `starting`, or `unhealthy`), which is what podman reports, alongside
+    /// the container's health after recording it. Nil when the test is disabled.
+    func runNow(containerId: String, config: HealthcheckConfig) async -> (status: String, health: ContainerHealth)? {
+        guard Self.parseTest(config.Test) != nil else { return nil }
+        let configTimeoutNs = config.Timeout.map { UInt64(max($0, 0)) } ?? Self.defaultTimeoutNs
+        let timeoutNs = max(configTimeoutNs, Self.minimumTimeoutNs)
+
+        // A scheduled probe still running would make this one fail at once (see ProbesInFlight);
+        // wait for it, up to one probe timeout, rather than report that as unhealthy.
+        let waitDeadline = Date().addingTimeInterval(Double(timeoutNs) / 1_000_000_000)
+        while Self.probesInFlight.isRunning(containerId), Date() < waitDeadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        if statuses[containerId] == nil {
+            statuses[containerId] = ContainerHealth(Status: "starting", FailingStreak: 0, Log: [])
+        }
+        let start = Date()
+        let exitCode = await runCheck(containerId: containerId, config: config, timeoutNs: timeoutNs)
+        let status = record(
+            containerId: containerId, exitCode: exitCode, start: start, end: Date(),
+            maxRetries: config.Retries ?? Self.defaultRetries, requireActive: false)
+        return (status, currentHealth(for: containerId) ?? ContainerHealth(Status: status, FailingStreak: 0, Log: []))
     }
 
     /// Parses Docker's `Test` field into a runnable command vector.
@@ -109,8 +138,8 @@ actor HealthCheckManager {
 
     // MARK: - Private
 
-    private func updateStatus(id: String, health: ContainerHealth, logEntry: HealthLogEntry? = nil) {
-        guard tasks[id] != nil else { return }  // already stopped
+    private func updateStatus(id: String, health: ContainerHealth, logEntry: HealthLogEntry? = nil, requireActive: Bool = true) {
+        guard !requireActive || tasks[id] != nil else { return }  // already stopped
         let previous = statuses[id]?.Status
         statuses[id] = health
         if let entry = logEntry {
@@ -150,10 +179,9 @@ actor HealthCheckManager {
         let startIntervalNs = max(configStartIntervalNs > 0 ? configStartIntervalNs : Self.defaultStartIntervalNs, intervalFloorNs)
 
         // Like Docker, probe every StartInterval during StartPeriod rather than waiting it out.
-        var startDeadline: Date? =
-            startPeriodNs > 0 ? Date().addingTimeInterval(Double(startPeriodNs) / 1_000_000_000) : nil
-
-        var failingStreak = 0
+        if startPeriodNs > 0 {
+            startDeadlines[containerId] = Date().addingTimeInterval(Double(startPeriodNs) / 1_000_000_000)
+        }
 
         while !Task.isCancelled {
             guard isActive(id: containerId) else { return }
@@ -164,32 +192,48 @@ actor HealthCheckManager {
 
             guard !Task.isCancelled else { return }
 
-            let entry = HealthLogEntry(
-                Start: Self.formatISO8601(start),
-                End: Self.formatISO8601(end),
-                ExitCode: exitCode,
-                Output: ""  // stdout capture from container VMs requires pipe infrastructure
-            )
+            record(containerId: containerId, exitCode: exitCode, start: start, end: end, maxRetries: maxRetries, requireActive: true)
 
-            let inStartPeriod = startDeadline.map { start < $0 } ?? false  // classify by when the probe began
-
-            if exitCode == 0 {
-                startDeadline = nil  // the first success ends the start period
-                failingStreak = 0
-                updateStatus(id: containerId, health: ContainerHealth(Status: "healthy", FailingStreak: 0, Log: []), logEntry: entry)
-            } else if inStartPeriod {
-                // Failures during the start period don't count toward Retries.
-                updateStatus(id: containerId, health: ContainerHealth(Status: "starting", FailingStreak: 0, Log: []), logEntry: entry)
-            } else {
-                failingStreak += 1
-                // Below Retries, keep the current status: a healthy container stays healthy.
-                let status = failingStreak >= maxRetries ? "unhealthy" : (statuses[containerId]?.Status ?? "starting")
-                updateStatus(id: containerId, health: ContainerHealth(Status: status, FailingStreak: failingStreak, Log: []), logEntry: entry)
-                log.debug("[healthcheck] \(containerId) → \(status) (streak=\(failingStreak), exit=\(exitCode))")
-            }
-
-            let stillStarting = startDeadline.map { Date() < $0 } ?? false
+            let stillStarting = startDeadlines[containerId].map { Date() < $0 } ?? false
             try? await Task.sleep(nanoseconds: stillStarting ? startIntervalNs : intervalNs)
+        }
+    }
+
+    /// Records one probe's outcome into the container's health and returns the outcome of that
+    /// probe alone: `healthy`, `starting` (a failure inside the start period), or `unhealthy`.
+    /// With `requireActive`, nothing is recorded once the loop has been stopped.
+    @discardableResult
+    private func record(containerId: String, exitCode: Int32, start: Date, end: Date, maxRetries: Int, requireActive: Bool) -> String {
+        let entry = HealthLogEntry(
+            Start: Self.formatISO8601(start),
+            End: Self.formatISO8601(end),
+            ExitCode: exitCode,
+            Output: ""  // stdout capture from container VMs requires pipe infrastructure
+        )
+
+        let inStartPeriod = startDeadlines[containerId].map { start < $0 } ?? false  // classify by when the probe began
+
+        if exitCode == 0 {
+            startDeadlines.removeValue(forKey: containerId)  // the first success ends the start period
+            updateStatus(
+                id: containerId, health: ContainerHealth(Status: "healthy", FailingStreak: 0, Log: []), logEntry: entry,
+                requireActive: requireActive)
+            return "healthy"
+        } else if inStartPeriod {
+            // Failures during the start period don't count toward Retries.
+            updateStatus(
+                id: containerId, health: ContainerHealth(Status: "starting", FailingStreak: 0, Log: []), logEntry: entry,
+                requireActive: requireActive)
+            return "starting"
+        } else {
+            let failingStreak = (statuses[containerId]?.FailingStreak ?? 0) + 1
+            // Below Retries, keep the current status: a healthy container stays healthy.
+            let status = failingStreak >= maxRetries ? "unhealthy" : (statuses[containerId]?.Status ?? "starting")
+            updateStatus(
+                id: containerId, health: ContainerHealth(Status: status, FailingStreak: failingStreak, Log: []), logEntry: entry,
+                requireActive: requireActive)
+            log.debug("[healthcheck] \(containerId) → \(status) (streak=\(failingStreak), exit=\(exitCode))")
+            return "unhealthy"
         }
     }
 
