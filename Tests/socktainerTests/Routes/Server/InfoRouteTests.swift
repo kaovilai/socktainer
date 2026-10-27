@@ -1,6 +1,7 @@
 import ContainerAPIClient
 import ContainerPersistence
 import ContainerResource
+import ContainerizationOCI
 import Foundation
 import Logging
 import Testing
@@ -77,6 +78,31 @@ private struct StubImageClient: ClientImageProtocol {
 }
 
 // MARK: - loadSystemConfig
+
+@Suite("InfoRoute.containerCounts")
+struct InfoRouteContainerCountsTests {
+    private func snapshot(_ id: String, _ status: RuntimeStatus) -> ContainerSnapshot {
+        let process = ProcessConfiguration(
+            executable: "/bin/sh", arguments: [], environment: [], workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0))
+        let image = ImageDescription(
+            reference: "alpine:latest",
+            descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0))
+        return ContainerSnapshot(
+            configuration: ContainerConfiguration(id: id, image: image, process: process), status: status, networks: [],
+            startedDate: status == .running ? Date(timeIntervalSinceNow: -5) : nil)
+    }
+
+    @Test("A paused container counts as paused, not running")
+    func pausedIsNotRunning() {
+        let state = ContainerPauseState()
+        let paused = snapshot("p", .running)
+        state.markPaused(paused)
+        let counts = InfoRoute.containerCounts([paused, snapshot("r", .running), snapshot("s", .stopped)], pauseState: state)
+        #expect(counts.running == 1)
+        #expect(counts.paused == 1)
+        #expect(counts.stopped == 1)
+    }
+}
 
 @Suite("InfoRoute.loadSystemConfig")
 struct InfoRouteLoadSystemConfigTests {

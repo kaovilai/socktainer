@@ -19,7 +19,7 @@ struct LibpodContainerWaitRoute: RouteCollection {
     }
 
     enum State: String, Equatable, Sendable {
-        case running, created, healthy, unhealthy
+        case running, created, paused, healthy, unhealthy
     }
 
     /// Poll interval for state conditions; podman's own default.
@@ -59,11 +59,13 @@ struct LibpodContainerWaitRoute: RouteCollection {
             return .state(.running)
         case "created", "configured":
             return .state(.created)
+        case "paused":
+            return .state(.paused)
         case "healthy":
             return .state(.healthy)
         case "unhealthy":
             return .state(.unhealthy)
-        case "paused", "stopping", "unknown":
+        case "stopping", "unknown":
             throw Abort(.notImplemented, reason: "waiting for condition '\(raw)' is not supported")
         default:
             throw Abort(.badRequest, reason: "Invalid wait condition: \(raw)")
@@ -128,7 +130,10 @@ struct LibpodContainerWaitRoute: RouteCollection {
         while !Task.isCancelled {
             do {
                 guard let container = try await client.getContainer(id: nativeId) else { return -1 }
-                if states.contains(.running), container.status == .running { return -1 }
+                // A paused container still runs as far as Apple Container is concerned; podman calls it paused.
+                let paused = ContainerPauseState.shared.isPaused(container)
+                if states.contains(.running), container.status == .running, !paused { return -1 }
+                if states.contains(.paused), paused { return -1 }
                 if states.contains(.created), container.isNeverStarted { return -1 }
                 if states.contains(.healthy) || states.contains(.unhealthy),
                     let status = await app.storage[HealthCheckManagerKey.self]?.currentHealth(for: nativeId)?.Status,
