@@ -19,18 +19,12 @@ translates the request and response in `Routes/Libpod/LibpodAdapter.swift` / `Li
 Routes that only wrap a Docker-compat route which is itself unimplemented say so in their row.
 
 Verified on macOS 26.6.2 with Apple Container 1.6.0 (matching this build) and `podman` 6.1.4:
-about 230 `podman` commands across handshake, images, volumes, networks, containers (lifecycle,
+about 230 `podman` commands (including attached `podman run`/`start -a`) across handshake, images, volumes, networks, containers (lifecycle,
 exec, logs, stats, cp, filters, formats, error mapping, ~40 `run` flags), `build` (single and
 multi-platform, Rosetta and QEMU builders), push to a local registry, and manifest lists.
 
 Limits that Docker-compat shares (libpod mirrors Docker-compat's support, it does not go beyond it):
 
-- **Attach never closes the connection.** For a stopped container with output-only attach (what
-  `podman run` without `-i` uses) the route answers `101` with a body stream and leaves the TCP
-  connection open after the container exits. The Docker CLI tolerates that; `podman run` (attached)
-  and `podman start -a` wait for EOF and do not return. `podman run -d`, `start`, `exec`, `logs`,
-  `wait` and `stop` all work. Fixing it means closing the upgraded channel in
-  `ContainerAttachRoute.attachStoppedOutputOnly`.
 - `podman events --since/--until`: Docker-compat's events route ignores both, so `--until` never ends.
 - `podman build -q` hangs (the Docker-compat `?q=1` build hangs the same way).
 - A never-started container reports `exited` (not `created`), so `ps --filter status=created` is empty.

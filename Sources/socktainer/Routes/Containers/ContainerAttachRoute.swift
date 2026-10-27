@@ -371,7 +371,30 @@ extension ContainerAttachRoute {
             headers.add(name: "Connection", value: "Upgrade")
             headers.add(name: "Upgrade", value: "tcp")
         }
-        let status: HTTPResponseStatus = (isUpgrade && hasConnectionUpgrade) ? .switchingProtocols : .ok
+        // A TCP upgrade hands the connection over to the raw socket: the stream ends only when the
+        // channel is closed, so this path owns the close once the container has exited. (A bare 101
+        // with a body stream never closes the connection; the Docker CLI copes, podman waits for EOF.)
+        if isUpgrade && hasConnectionUpgrade {
+            return Response.dockerTCPUpgrade(execId: container.id, ttyEnabled: isTTY) { channel, _ in
+                guard
+                    let process = await PendingAttachStart.awaitStart(
+                        containerId: container.id, token: token, pipes: pipes,
+                        clientGone: { try? await channel.closeFuture.get() })
+                else {
+                    _ = try? await channel.close()
+                    return
+                }
+                await pumpStoppedOutput(
+                    process: process, pipes: pipes, container: container, hexId: hexId, isTTY: isTTY, stderrOnly: stderrOnly, req: req,
+                    write: { buffer in _ = try? await channel.writeAndFlush(buffer).get() })
+                // Close the channel gracefully only if still open; closing an already-closed channel
+                // trips a NIO precondition.
+                _ = channel.eventLoop.submit {
+                    guard channel.isActive else { return }
+                    channel.close(promise: nil)
+                }
+            }
+        }
 
         let body = Response.Body { writer in
             Task.detached {
@@ -383,56 +406,73 @@ extension ContainerAttachRoute {
                         containerId: container.id, token: token, pipes: pipes,
                         clientGone: { await untilWriteFails(writer, isTTY: isTTY) })
                 else { return }
-                // Joins the run `POST /start` opened for this start.
-                let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
-                await ProcessRegistry.shared.set(id: container.id, process: process)
-
-                await withTaskGroup(of: Void.self) { group in
-                    // Process monitor — stdout/stderr write ends and stdin read are Apple-owned.
-                    group.addTask {
-                        _ = await ContainerProcessExitMonitor.run(
-                            wait: { try await process.wait() },
-                            hexId: hexId,
-                            nativeId: container.id,
-                            fallbackImage: container.configuration.image.reference,
-                            fallbackLabels: LabelNormalization.restore(container.configuration.labels),
-                            dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                            broadcaster: req.application.storage[EventBroadcasterKey.self],
-                            runEpoch: runEpoch
-                        )
-                    }
-
-                    // Stdout reader
-                    if let stdoutHandle = pipes.stdout?.read {
-                        let frameType: DockerStreamFrame.StreamType = stderrOnly ? .stderr : .stdout
-                        group.addTask {
-                            defer { try? stdoutHandle.close() }
-                            while let data = try? stdoutHandle.read(upToCount: 8192), !data.isEmpty {
-                                var buf = sharedAllocator.buffer(capacity: data.count + (isTTY ? 0 : 8))
-                                buf.writeDockerFrame(streamType: frameType, data: data, ttyMode: isTTY)
-                                _ = try? await writer.write(.buffer(buf)).get()
-                            }
-                        }
-                    }
-
-                    // Stderr reader (separate stream when both stdout and stderr requested)
-                    if let stderrHandle = pipes.stderr?.read {
-                        group.addTask {
-                            defer { try? stderrHandle.close() }
-                            while let data = try? stderrHandle.read(upToCount: 8192), !data.isEmpty {
-                                var buf = sharedAllocator.buffer(capacity: data.count + 8)
-                                buf.writeDockerFrame(streamType: .stderr, data: data, ttyMode: false)
-                                _ = try? await writer.write(.buffer(buf)).get()
-                            }
-                        }
-                    }
-
-                    for await _ in group {}
-                }
+                await pumpStoppedOutput(
+                    process: process, pipes: pipes, container: container, hexId: hexId, isTTY: isTTY, stderrOnly: stderrOnly, req: req,
+                    write: { buffer in _ = try? await writer.write(.buffer(buffer)).get() })
             }
         }
 
-        return Response(status: status, headers: headers, body: body)
+        return Response(status: .ok, headers: headers, body: body)
+    }
+
+    /// Streams the started container's output as Docker frames through `write` until its process has
+    /// exited and both pipes are drained. Shared by the upgraded and the plain-HTTP output-only attach.
+    static func pumpStoppedOutput(
+        process: ClientProcess,
+        pipes: StdioPipes,
+        container: ContainerSnapshot,
+        hexId: String,
+        isTTY: Bool,
+        stderrOnly: Bool,
+        req: Request,
+        write: @escaping @Sendable (ByteBuffer) async -> Void
+    ) async {
+        // Joins the run `POST /start` opened for this start.
+        let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
+        await ProcessRegistry.shared.set(id: container.id, process: process)
+
+        await withTaskGroup(of: Void.self) { group in
+            // Process monitor — stdout/stderr write ends and stdin read are Apple-owned.
+            group.addTask {
+                _ = await ContainerProcessExitMonitor.run(
+                    wait: { try await process.wait() },
+                    hexId: hexId,
+                    nativeId: container.id,
+                    fallbackImage: container.configuration.image.reference,
+                    fallbackLabels: LabelNormalization.restore(container.configuration.labels),
+                    dnsServer: req.application.storage[SocktainerDNSServerKey.self],
+                    broadcaster: req.application.storage[EventBroadcasterKey.self],
+                    runEpoch: runEpoch
+                )
+            }
+
+            // Stdout reader
+            if let stdoutHandle = pipes.stdout?.read {
+                let frameType: DockerStreamFrame.StreamType = stderrOnly ? .stderr : .stdout
+                group.addTask {
+                    defer { try? stdoutHandle.close() }
+                    while let data = try? stdoutHandle.read(upToCount: 8192), !data.isEmpty {
+                        var buf = sharedAllocator.buffer(capacity: data.count + (isTTY ? 0 : 8))
+                        buf.writeDockerFrame(streamType: frameType, data: data, ttyMode: isTTY)
+                        await write(buf)
+                    }
+                }
+            }
+
+            // Stderr reader (separate stream when both stdout and stderr requested)
+            if let stderrHandle = pipes.stderr?.read {
+                group.addTask {
+                    defer { try? stderrHandle.close() }
+                    while let data = try? stderrHandle.read(upToCount: 8192), !data.isEmpty {
+                        var buf = sharedAllocator.buffer(capacity: data.count + 8)
+                        buf.writeDockerFrame(streamType: .stderr, data: data, ttyMode: false)
+                        await write(buf)
+                    }
+                }
+            }
+
+            for await _ in group {}
+        }
     }
 
     private static func handleAttachWithStdin(
