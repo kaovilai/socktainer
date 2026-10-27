@@ -9,6 +9,36 @@ struct LibpodPodMember: Sendable, Equatable {
     let podID: String
 }
 
+/// One member's resource usage, in the units of podman's `define.ContainerStats`.
+struct LibpodPodMemberStats: Sendable, Equatable {
+    var cpuPercent: Double = 0
+    var memUsage: Int = 0
+    var memLimit: Int = 0
+    var memPercent: Double = 0
+    var netInput: Int = 0
+    var netOutput: Int = 0
+    var blockInput: Int = 0
+    var blockOutput: Int = 0
+    var pids: Int = 0
+}
+
+extension LibpodPodMemberStats {
+    /// Reads the `ContainerStats` object built by `LibpodSchema.containerStats`.
+    init(podmanStats stats: [String: Any]) {
+        func int(_ key: String) -> Int { (stats[key] as? NSNumber)?.intValue ?? 0 }
+        func double(_ key: String) -> Double { (stats[key] as? NSNumber)?.doubleValue ?? 0 }
+        var input = 0
+        var output = 0
+        for case let network as [String: Any] in (stats["Network"] as? [String: Any] ?? [:]).values {
+            input += (network["RxBytes"] as? NSNumber)?.intValue ?? 0
+            output += (network["TxBytes"] as? NSNumber)?.intValue ?? 0
+        }
+        self.init(
+            cpuPercent: double("CPU"), memUsage: int("MemUsage"), memLimit: int("MemLimit"), memPercent: double("MemPerc"),
+            netInput: input, netOutput: output, blockInput: int("BlockInput"), blockOutput: int("BlockOutput"), pids: int("PIDs"))
+    }
+}
+
 /// Pure translations between socktainer's pod records and podman's pod wire shapes
 /// (`types.ListPodsReport`, `define.InspectPodData`, `specgen.PodSpecGenerator`).
 enum LibpodPodSchema {
@@ -181,6 +211,51 @@ enum LibpodPodSchema {
         ]
         if !pod.labels.isEmpty { data["Labels"] = pod.labels }
         return data
+    }
+
+    // MARK: Stats
+
+    /// `types.PodStatsReport` for one member, formatted as podman's `podsToStatsReport` does.
+    /// `Name` is the container's name, as in podman.
+    static func statsReport(pod: PodRecord, member: LibpodPodMember, stats: LibpodPodMemberStats) -> [String: Any] {
+        [
+            "CPU": percent(stats.cpuPercent),
+            "MemUsage": combinedSizes(stats.memUsage, stats.memLimit, size: humanSize),
+            "MemUsageBytes": combinedSizes(stats.memUsage, stats.memLimit, size: bytesSize),
+            "Mem": percent(stats.memPercent),
+            "NetIO": combinedSizes(stats.netInput, stats.netOutput, size: humanSize),
+            "BlockIO": combinedSizes(stats.blockInput, stats.blockOutput, size: humanSize),
+            "PIDS": stats.pids == 0 ? "--" : String(stats.pids),
+            "Pod": String(pod.id.prefix(12)),
+            "CID": String(member.id.prefix(12)),
+            "Name": member.name,
+        ]
+    }
+
+    static func percent(_ value: Double) -> String { String(format: "%.2f%%", value) }
+
+    static func combinedSizes(_ a: Int, _ b: Int, size: (Int) -> String) -> String {
+        a == 0 && b == 0 ? "-- / --" : "\(size(a)) / \(size(b))"
+    }
+
+    /// go-units `HumanSize`: decimal units, four significant digits ("12.5MB").
+    static func humanSize(_ bytes: Int) -> String {
+        scaledSize(Double(bytes), base: 1000, units: ["B", "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"])
+    }
+
+    /// go-units `BytesSize`: binary units, four significant digits ("11.92MiB").
+    static func bytesSize(_ bytes: Int) -> String {
+        scaledSize(Double(bytes), base: 1024, units: ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB"])
+    }
+
+    private static func scaledSize(_ value: Double, base: Double, units: [String]) -> String {
+        var size = value
+        var index = 0
+        while size >= base && index < units.count - 1 {
+            size /= base
+            index += 1
+        }
+        return String(format: "%.4g", size) + units[index]
     }
 
     // MARK: Filters

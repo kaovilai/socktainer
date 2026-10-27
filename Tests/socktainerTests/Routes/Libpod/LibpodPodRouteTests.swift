@@ -28,7 +28,24 @@ private actor FakePodRuntime {
         case .start, .restart: set("running")
         case .stop, .kill: set("exited")
         case .remove: containers.remove(at: index)
+        case .pause: set("paused")
+        case .unpause: set("running")
         }
+    }
+
+    /// One `ps` row per member, so a merged table shows which members were asked.
+    func top(_ id: String, _ psArgs: String?) throws -> RESTContainerTop {
+        actions.append("top \(id) \(psArgs ?? "-")")
+        if failing.contains(id) { throw Abort(.conflict, reason: "container \(id) is not running") }
+        return RESTContainerTop(Titles: ["PID", "COMMAND"], Processes: [["1", "sleep-\(id)"]])
+    }
+
+    func stats(_ id: String) throws -> LibpodPodMemberStats {
+        actions.append("stats \(id)")
+        if failing.contains(id) { throw Abort(.conflict, reason: "container \(id) is not running") }
+        return LibpodPodMemberStats(
+            cpuPercent: 1.5, memUsage: 12_500_000, memLimit: 1_073_741_824, memPercent: 1.164, netInput: 1_000, netOutput: 0,
+            blockInput: 0, blockOutput: 0, pids: 3)
     }
 
     func ensure(_ pod: PodRecord) { if let network = pod.network { networks.insert(network) } }
@@ -42,7 +59,9 @@ private actor FakePodRuntime {
             members: { _ in await self.containers },
             perform: { _, action, id in try await self.perform(action, id) },
             ensureNetwork: { _, pod in await self.ensure(pod) },
-            removeNetwork: { _, name in await self.removeNetwork(name) }
+            removeNetwork: { _, name in await self.removeNetwork(name) },
+            top: { _, id, psArgs in try await self.top(id, psArgs) },
+            stats: { _, id in try await self.stats(id) }
         )
     }
 }
@@ -280,6 +299,133 @@ struct LibpodPodRouteTests {
             }
         }
         #expect(await store.all().map(\.name).sorted() == ["pd-empty", "pd-y"])
+    }
+
+    @Test("pause pauses only running members and unpause only paused ones, answering podman's report")
+    func pauseAndUnpause() async throws {
+        let fake = FakePodRuntime()
+        try await withPodApp(store: PodStore(), fake: fake) { app in
+            let id = try await createPod(app, #"{"name":"pd-pz"}"#)
+            await fake.add(LibpodPodMember(id: "c1", name: "a", state: "running", podID: id))
+            await fake.add(LibpodPodMember(id: "c2", name: "b", state: "exited", podID: id))
+            try await app.testing().test(.POST, "/v5.0.0/libpod/pods/pd-pz/pause") { res async in
+                #expect(res.status == .ok)
+                let body = json(res) as? [String: Any]
+                #expect(body?["Id"] as? String == id)
+                #expect(body?["Errs"] as? [String] == [])
+            }
+            #expect(await fake.actions == ["pause c1"])
+            try await app.testing().test(.POST, "/v5.0.0/libpod/pods/pd-pz/unpause") { res async in
+                #expect(res.status == .ok)
+            }
+            #expect(await fake.actions == ["pause c1", "unpause c1"])
+            try await app.testing().test(.POST, "/v5.0.0/libpod/pods/missing/pause") { res async in
+                #expect(res.status == .notFound)
+                #expect(res.body.string.contains("no such pod"))
+            }
+        }
+    }
+
+    @Test("a member that cannot be paused makes pause a 409 naming it")
+    func pauseFailure() async throws {
+        let fake = FakePodRuntime()
+        try await withPodApp(store: PodStore(), fake: fake) { app in
+            let id = try await createPod(app, #"{"name":"pd-pf"}"#)
+            await fake.add(LibpodPodMember(id: "c1", name: "a", state: "running", podID: id))
+            await fake.fail("c1")
+            try await app.testing().test(.POST, "/v5.0.0/libpod/pods/pd-pf/pause") { res async in
+                #expect(res.status == .conflict)
+                let errs = (json(res) as? [String: Any])?["Errs"] as? [String]
+                #expect(errs == ["pausing container a: boom"])
+            }
+        }
+    }
+
+    @Test("top merges the processes of every running member under one header")
+    func top() async throws {
+        let fake = FakePodRuntime()
+        try await withPodApp(store: PodStore(), fake: fake) { app in
+            let id = try await createPod(app, #"{"name":"pd-top"}"#)
+            await fake.add(LibpodPodMember(id: "c1", name: "a", state: "running", podID: id))
+            await fake.add(LibpodPodMember(id: "c2", name: "b", state: "exited", podID: id))
+            await fake.add(LibpodPodMember(id: "c3", name: "c", state: "running", podID: id))
+            await fake.add(LibpodPodMember(id: "c4", name: "d", state: "running", podID: "elsewhere"))
+            try await app.testing().test(.GET, "/v5.0.0/libpod/pods/pd-top/top?ps_args=pid,args") { res async in
+                #expect(res.status == .ok)
+                let body = json(res) as? [String: Any]
+                #expect(body?["Titles"] as? [String] == ["PID", "COMMAND"])
+                #expect(body?["Processes"] as? [[String]] == [["1", "sleep-c1"], ["1", "sleep-c3"]])
+            }
+            #expect(await fake.actions == ["top c1 pid,args", "top c3 pid,args"])
+        }
+    }
+
+    @Test("top uses podman's default descriptors, skips members that stopped, and rejects what is not a descriptor")
+    func topDefaultsAndErrors() async throws {
+        let fake = FakePodRuntime()
+        try await withPodApp(store: PodStore(), fake: fake) { app in
+            let id = try await createPod(app, #"{"name":"pd-top2"}"#)
+            await fake.add(LibpodPodMember(id: "c1", name: "a", state: "running", podID: id))
+            await fake.fail("c1")
+            try await app.testing().test(.GET, "/v5.0.0/libpod/pods/pd-top2/top") { res async in
+                #expect(res.status == .ok)
+                let body = json(res) as? [String: Any]
+                #expect(body?["Titles"] as? [String] == ["USER", "PID", "PPID", "%CPU", "ELAPSED", "TTY", "TIME", "COMMAND"])
+                #expect((body?["Processes"] as? [[String]])?.isEmpty == true)
+            }
+            try await app.testing().test(.GET, "/v5.0.0/libpod/pods/pd-top2/top?ps_args=-ef") { res async in
+                #expect(res.status == .internalServerError)
+                #expect(res.body.string.contains("unknown descriptor"))
+            }
+            try await app.testing().test(.GET, "/v5.0.0/libpod/pods/pd-top2/top?delay=0") { res async in
+                #expect(res.status == .badRequest)
+            }
+            try await app.testing().test(.GET, "/v5.0.0/libpod/pods/missing/top") { res async in
+                #expect(res.status == .notFound)
+            }
+        }
+    }
+
+    @Test("stats reports each running or paused member of the pods asked for, in podman's format")
+    func stats() async throws {
+        let fake = FakePodRuntime()
+        try await withPodApp(store: PodStore(), fake: fake) { app in
+            let id = try await createPod(app, #"{"name":"pd-sta"}"#)
+            let other = try await createPod(app, #"{"name":"pd-stb"}"#)
+            await fake.add(LibpodPodMember(id: "c1aaaaaaaaaaaaaa", name: "a", state: "running", podID: id))
+            await fake.add(LibpodPodMember(id: "c2", name: "b", state: "exited", podID: id))
+            await fake.add(LibpodPodMember(id: "c3", name: "c", state: "paused", podID: other))
+            try await app.testing().test(.GET, "/v5.0.0/libpod/pods/stats?namesOrIDs=pd-sta") { res async in
+                #expect(res.status == .ok)
+                let reports = json(res) as? [[String: String]]
+                #expect(reports?.count == 1)
+                let report = reports?.first
+                #expect(report?["CID"] == "c1aaaaaaaaaa")
+                #expect(report?["Pod"] == String(id.prefix(12)))
+                #expect(report?["Name"] == "a")
+                #expect(report?["CPU"] == "1.50%")
+                #expect(report?["MemUsage"] == "12.5MB / 1.074GB")
+                #expect(report?["MemUsageBytes"] == "11.92MiB / 1GiB")
+                #expect(report?["Mem"] == "1.16%")
+                #expect(report?["NetIO"] == "1kB / 0B")
+                #expect(report?["BlockIO"] == "-- / --")
+                #expect(report?["PIDS"] == "3")
+            }
+            // Neither names nor `all`: every pod, as podman's v1 compatibility does.
+            try await app.testing().test(.GET, "/v5.0.0/libpod/pods/stats") { res async in
+                #expect((json(res) as? [[String: Any]])?.compactMap { $0["Name"] as? String }.sorted() == ["a", "c"])
+            }
+            try await app.testing().test(.GET, "/v5.0.0/libpod/pods/stats?all=true") { res async in
+                #expect((json(res) as? [[String: Any]])?.count == 2)
+            }
+            try await app.testing().test(.GET, "/v5.0.0/libpod/pods/stats?all=true&namesOrIDs=pd-sta") { res async in
+                #expect(res.status == .internalServerError)
+            }
+            try await app.testing().test(.GET, "/v5.0.0/libpod/pods/stats?namesOrIDs=missing") { res async in
+                #expect(res.status == .notFound)
+                #expect(res.body.string.contains("no such pod"))
+            }
+        }
     }
 }
 
