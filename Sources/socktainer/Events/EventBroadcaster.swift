@@ -23,6 +23,13 @@ struct DockerEvent: Codable {
     /// Podman's `entities.Event.HealthStatus`; only set on translated libpod
     /// `health_status` events and omitted from the JSON otherwise.
     var HealthStatus: String? = nil
+    /// Attributes only the libpod translation adds, for facts podman reports that moby's event
+    /// shape has no room for (the container name and image on a network event). Never encoded.
+    var libpodAttributes: [String: String] = [:]
+
+    private enum CodingKeys: String, CodingKey {
+        case status, id, from, `Type`, Action, Actor, scope, time, timeNano, HealthStatus
+    }
 }
 
 extension DockerEvent {

@@ -64,7 +64,7 @@ enum LibpodEventTranslation {
         var actorID = event.Actor.ID
         if event.Type == "network", let container = attributes["container"] {
             actorID = container
-            attributes = ["network": attributes["name"] ?? event.Actor.ID]
+            attributes = event.libpodAttributes.merging(["network": attributes["name"] ?? event.Actor.ID]) { _, network in network }
         }
 
         var translated = DockerEvent(

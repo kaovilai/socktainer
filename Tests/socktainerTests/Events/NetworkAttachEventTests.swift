@@ -58,7 +58,15 @@ struct NetworkAttachEventTests {
         let translated = try #require(LibpodEventTranslation.translate(events[0]))
         #expect(translated.Action == "connect")
         #expect(translated.Actor.ID == "c0ffee")
-        #expect(translated.Actor.Attributes == ["network": "n"])
+        #expect(translated.Actor.Attributes == ["network": "n", "name": "net-ev-ctr", "image": "alpine:latest"])
+    }
+
+    @Test("the container name podman reports stays out of the Docker event's JSON")
+    func dockerJSONOmitsLibpodAttributes() async throws {
+        let events = try await capture("connect", networks: ["n"], client: DriverStubNetworkClient())
+        let json = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(events[0])) as? [String: Any])
+        #expect(json["libpodAttributes"] == nil)
+        #expect((json["Actor"] as? [String: Any])?["Attributes"] as? [String: String] == ["container": "c0ffee", "name": "n", "type": "hostOnly"])
     }
 }
 

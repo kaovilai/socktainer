@@ -6,7 +6,8 @@ import Logging
 /// (daemon.connectToNetwork) and `disconnect` while releasing it during exit cleanup
 /// (daemon.releaseNetwork), both via `LogNetworkEventWithAttributes`: Actor.ID is the
 /// network ID, attributes are `container` (full container id) plus the network's
-/// `name` and `type` (driver).
+/// `name` and `type` (driver). The libpod translation turns them into podman's
+/// container-centric shape, naming the container.
 enum NetworkAttachEvents {
     static func broadcastConnects(
         for snapshot: ContainerSnapshot,
@@ -45,14 +46,17 @@ enum NetworkAttachEvents {
         for network in networkNames(in: snapshot) {
             // Network Id and Name are both the Apple network id; the lookup supplies the driver.
             let summary = try? await networkClient.getNetwork(id: network, logger: logger)
-            await broadcaster.broadcast(
-                DockerEvent.make(
-                    type: "network", action: action, actorID: summary?.Id ?? network,
-                    attributes: [
-                        "container": containerId,
-                        "name": summary?.Name ?? network,
-                        "type": summary?.Driver ?? "nat",
-                    ]))
+            var event = DockerEvent.make(
+                type: "network", action: action, actorID: summary?.Id ?? network,
+                attributes: [
+                    "container": containerId,
+                    "name": summary?.Name ?? network,
+                    "type": summary?.Driver ?? "nat",
+                ])
+            // podman's network events name the container (libpod `newNetworkEvent`); moby's
+            // `name` attribute is the network's, so the container's rides along for translation.
+            event.libpodAttributes = ["name": snapshot.id, "image": snapshot.configuration.image.reference]
+            await broadcaster.broadcast(event)
         }
     }
 }
