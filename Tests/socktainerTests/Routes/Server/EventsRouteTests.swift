@@ -72,6 +72,76 @@ struct EventsRouteTests {
         }
     }
 
+    /// Runs `body` against a live `/events` server with a connection that has sent `query`, tearing the
+    /// server down afterwards whether or not the checks passed.
+    private func withEventsConnection(query: String, _ body: @escaping @Sendable (RawHTTPConnection, EventBroadcaster) async throws -> Void) async throws {
+        let broadcaster = EventBroadcaster()
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = broadcaster
+            try app.register(collection: EventsRoute(client: MockHealthCheckClient()))
+            app.http.server.configuration.shutdownTimeout = .milliseconds(100)
+            try await app.server.start(address: .hostname("127.0.0.1", port: 0))
+
+            var connection: RawHTTPConnection?
+            let outcome: Result<Void, any Error>
+            do {
+                let port = try #require(app.http.server.shared.localAddress?.port)
+                let conn = try RawHTTPConnection(port: port)
+                connection = conn
+                try conn.send("GET /v1.51/events\(query) HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                try await body(conn, broadcaster)
+                outcome = .success(())
+            } catch {
+                outcome = .failure(error)
+            }
+            connection?.close()
+            await app.server.shutdown()
+            try outcome.get()
+        }
+    }
+
+    @Test("until in the past ends the stream straight away instead of streaming forever")
+    func untilInThePast() async throws {
+        let past = Int(Date().timeIntervalSince1970) - 10
+        try await withEventsConnection(query: "?until=\(past)") { conn, _ in
+            let response = try await Task.detached { try conn.read(until: "0\r\n\r\n", timeout: 3) }.value
+            #expect(response.hasPrefix("HTTP/1.1 200"))
+        }
+    }
+
+    @Test("until in the near future ends the stream at that time even when no event arrives")
+    func untilInTheNearFuture() async throws {
+        let until = Date().timeIntervalSince1970 + 1
+        try await withEventsConnection(query: "?until=\(until)") { conn, _ in
+            let started = Date()
+            _ = try await Task.detached { try conn.read(until: "0\r\n\r\n", timeout: 5) }.value
+            #expect(Date().timeIntervalSince(started) < 4)
+        }
+    }
+
+    @Test("events older than since are dropped; until still ends the stream")
+    func sinceInTheFutureDropsEvents() async throws {
+        let now = Date().timeIntervalSince1970
+        try await withEventsConnection(query: "?since=\(now + 60)&until=\(now + 1.5)") { conn, broadcaster in
+            await broadcaster.broadcast(Self.event("start"))
+            let response = try await Task.detached { try conn.read(until: "0\r\n\r\n", timeout: 5) }.value
+            #expect(!response.contains(#""Action":"start""#))
+        }
+    }
+
+    @Test("since and until accept Unix seconds, fractional seconds and RFC3339")
+    func timestampParsing() {
+        #expect(EventsRoute.parseTimestamp("1700000000") == Date(timeIntervalSince1970: 1_700_000_000))
+        #expect(EventsRoute.parseTimestamp("1700000000.5") == Date(timeIntervalSince1970: 1_700_000_000.5))
+        #expect(EventsRoute.parseTimestamp("2023-11-14T22:13:20Z") == Date(timeIntervalSince1970: 1_700_000_000))
+        #expect(EventsRoute.parseTimestamp("") == nil)
+        #expect(EventsRoute.parseTimestamp(nil) == nil)
+        #expect(EventsRoute.parseTimestamp("garbage") == nil)
+    }
+
     private static func eventually(timeout: Duration = .seconds(3), _ condition: () async -> Bool) async -> Bool {
         let deadline = ContinuousClock.now + timeout
         while await !condition() {
