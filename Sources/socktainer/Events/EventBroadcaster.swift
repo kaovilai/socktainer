@@ -153,14 +153,26 @@ actor EventBroadcaster {
         return value
     }
 
+    static let persistenceFileName = "socktainer-events.jsonl"
+
     private var continuations: [UUID: AsyncStream<DockerEvent>.Continuation] = [:]
     /// When each (actor id, action) of container and image events was last broadcast, so `ExternalEventWatcher`
     /// can skip transitions socktainer's own routes already reported.
     private var lastEmitted: [String: Date] = [:]
     private var history: EventHistory
+    private var journal: EventJournal?
 
-    init(historyLimit: Int = EventBroadcaster.configuredHistoryLimit()) {
+    /// With a `persistenceURL`, the history is also kept in that file and reloaded from it, so
+    /// `since`/`until` replay covers events from before a daemon restart. A history limit of 0
+    /// keeps nothing, in memory or on disk.
+    init(historyLimit: Int = EventBroadcaster.configuredHistoryLimit(), persistenceURL: URL? = nil) {
         history = EventHistory(capacity: historyLimit)
+        guard let persistenceURL, history.capacity > 0 else { return }
+        let journal = EventJournal(url: persistenceURL, capacity: history.capacity)
+        for event in journal.load() {
+            history.append(event)
+        }
+        self.journal = journal
     }
 
     func stream() -> AsyncStream<DockerEvent> {
@@ -187,6 +199,7 @@ actor EventBroadcaster {
 
     func broadcast(_ event: DockerEvent) {
         history.append(event)
+        journal?.append(event, compactingTo: history.events)
         if event.Type == "container" || event.Type == "image" {
             let now = Date()
             lastEmitted = lastEmitted.filter { now.timeIntervalSince($0.value) < 60 }
@@ -222,5 +235,78 @@ actor EventBroadcaster {
 
     private func removeContinuation(id: UUID) {
         continuations.removeValue(forKey: id)
+    }
+}
+
+/// Append-only JSON Lines copy of the event history. Each line is one event; the file is
+/// rewritten with just the in-memory history once it holds twice that many lines, so it never
+/// grows past `2 * capacity` events.
+final class EventJournal {
+    /// The libpod-only attributes are not part of the Docker encoding, so a line carries them
+    /// alongside the event.
+    private struct Line: Codable {
+        let event: DockerEvent
+        let libpodAttributes: [String: String]?
+    }
+
+    let url: URL
+    let capacity: Int
+    private var lineCount = 0
+    /// Set when the file ends in a line cut short, so the next event starts on a line of its own.
+    private var endsMidLine = false
+    private let log = Logger(label: "socktainer.events")
+
+    init(url: URL, capacity: Int) {
+        self.url = url
+        self.capacity = capacity
+    }
+
+    /// The last `capacity` events in the file, oldest first. Lines that do not decode (a write cut
+    /// short by a crash) are skipped.
+    func load() -> [DockerEvent] {
+        guard let data = FileManager.default.contents(atPath: url.path) else { return [] }
+        let decoder = JSONDecoder()
+        let lines = data.split(separator: UInt8(ascii: "\n"))
+        lineCount = lines.count
+        endsMidLine = data.last != UInt8(ascii: "\n") && !data.isEmpty
+        return lines.suffix(capacity).compactMap { line in
+            guard let decoded = try? decoder.decode(Line.self, from: Data(line)) else { return nil }
+            var event = decoded.event
+            event.libpodAttributes = decoded.libpodAttributes ?? [:]
+            return event
+        }
+    }
+
+    /// Appends `event`; when the file has reached twice the capacity, rewrites it from `history`
+    /// (which already includes `event`) instead.
+    func append(_ event: DockerEvent, compactingTo history: @autoclosure () -> [DockerEvent]) {
+        do {
+            if lineCount + 1 > 2 * capacity {
+                let events = history()
+                try events.reduce(into: Data()) { $0.append(try Self.encode($1)) }.write(to: url, options: .atomic)
+                lineCount = events.count
+                endsMidLine = false
+                return
+            }
+            var line = try Self.encode(event)
+            if endsMidLine { line.insert(UInt8(ascii: "\n"), at: 0) }
+            if let handle = FileHandle(forWritingAtPath: url.path) {
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: line)
+            } else {
+                try line.write(to: url, options: .atomic)
+            }
+            endsMidLine = false
+            lineCount += 1
+        } catch {
+            log.warning("could not record event in \(url.path): \(error)")
+        }
+    }
+
+    private static func encode(_ event: DockerEvent) throws -> Data {
+        var data = try JSONEncoder().encode(Line(event: event, libpodAttributes: event.libpodAttributes.isEmpty ? nil : event.libpodAttributes))
+        data.append(UInt8(ascii: "\n"))
+        return data
     }
 }
