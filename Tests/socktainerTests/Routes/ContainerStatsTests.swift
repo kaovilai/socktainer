@@ -45,24 +45,28 @@ struct ContainerStatsTests {
         #expect(stats.precpu_stats.cpu_usage.total_usage == 1_000_000_000)
     }
 
-    @Test("precpu_stats system_cpu_usage is 0 (no elapsed time for baseline)")
-    func precpuSystemIsZero() {
+    @Test("precpu_stats carries the host CPU counter at the previous read, as Docker's does")
+    func precpuSystemIsCumulative() {
         let sample = makeSample(cpuUsec: 500_000)
-        let t0 = Date()
-        let t1 = Date(timeIntervalSince1970: t0.timeIntervalSince1970 + 1)
-        let stats = RESTContainerStats.build(id: "c1", name: "/c1", prev: sample, curr: sample, prevRead: t0, currRead: t1)
-        #expect(stats.precpu_stats.system_cpu_usage == 0)
+        let boot = Date(timeIntervalSince1970: 1_000)
+        let t0 = Date(timeIntervalSince1970: 1_010)
+        let t1 = Date(timeIntervalSince1970: 1_011)
+        let stats = RESTContainerStats.build(
+            id: "c1", name: "/c1", prev: sample, curr: sample, prevRead: t0, currRead: t1, hostBootDate: boot)
+        #expect(stats.precpu_stats.system_cpu_usage == UInt64(hostCPUCoreCount()) * 10_000_000_000)
+        #expect(stats.cpu_stats.system_cpu_usage == UInt64(hostCPUCoreCount()) * 11_000_000_000)
     }
 
-    @Test("system_cpu_usage equals numCPUs × elapsed nanoseconds")
+    @Test("system_cpu_usage advances by numCPUs × elapsed nanoseconds between samples")
     func systemCPUUsage() {
         let sample = makeSample()
         let t0 = Date()
         let t1 = Date(timeIntervalSince1970: t0.timeIntervalSince1970 + 1)
         let stats = RESTContainerStats.build(id: "c1", name: "/c1", prev: sample, curr: sample, prevRead: t0, currRead: t1)
         let expected = UInt64(hostCPUCoreCount()) * 1_000_000_000
+        let delta = Int64(stats.cpu_stats.system_cpu_usage) - Int64(stats.precpu_stats.system_cpu_usage)
         // Allow ±5ms tolerance for timing
-        #expect(abs(Int64(stats.cpu_stats.system_cpu_usage) - Int64(expected)) < 5_000_000)
+        #expect(abs(delta - Int64(expected)) < 5_000_000)
     }
 
     @Test("online_cpus matches host CPU count")
