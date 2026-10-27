@@ -206,6 +206,24 @@ struct LibpodSchemaTests {
         #expect((stats["Network"] as? [String: Any])?["eth0"] != nil)
     }
 
+    @Test("container stats report podman's cumulative CPU time as UpTime and average CPU since start")
+    func containerStatsUpTimeAndAverage() {
+        let docker: [String: Any] = [
+            "name": "/web", "id": "abc",
+            "cpu_stats": ["cpu_usage": ["total_usage": 2_000_000_000, "usage_in_kernelmode": 500], "system_cpu_usage": 4000, "online_cpus": 2],
+            "precpu_stats": ["cpu_usage": ["total_usage": 1_999_000_000], "system_cpu_usage": 2000, "online_cpus": 2],
+        ]
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        let stats = LibpodSchema.containerStats(docker, containerID: "abc", startedAt: now.addingTimeInterval(-10), now: now)
+        #expect(stats["UpTime"] as? Int == 2_000_000_000)
+        #expect(stats["Duration"] as? Int == 2_000_000_000)
+        #expect(stats["CPUNano"] as? Int == 2_000_000_000)
+        #expect(stats["CPUSystemNano"] as? Int == 500)
+        // 2 s of CPU over 10 s running.
+        #expect(abs((stats["AvgCPU"] as? Double ?? 0) - 20) < 0.0001)
+        #expect(stats["AvgCPU"] as? Double != stats["CPU"] as? Double)
+    }
+
     @Test("podman's info and df use podman's own top-level shapes")
     func infoAndDF() {
         let info = object(LibpodSchema.info(["Name": "host", "NCPU": 4, "MemTotal": 1000, "ServerVersion": "1.5.0", "Images": 2, "Containers": 3]))
