@@ -128,11 +128,8 @@ extension ContainerListRoute {
                 let baseStatus: String
                 switch container.status {
                 case .running:
-                    if let started = container.startedDate {
-                        baseStatus = "Up \(Self.humanReadableAge(since: started))"
-                    } else {
-                        baseStatus = "Up"
-                    }
+                    let up = container.startedDate.map { "Up \(Self.humanReadableAge(since: $0))" } ?? "Up"
+                    baseStatus = mobyState == "paused" ? "\(up) (Paused)" : up
                 case .stopped:
                     if container.isNeverStarted {
                         baseStatus = "Created"
