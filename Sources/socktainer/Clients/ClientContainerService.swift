@@ -365,8 +365,20 @@ struct ClientContainerService: ClientContainerProtocol {
             return
         }
 
+        try await checkExclusiveVolumes(container)
+
         try await VMLifecycleAdmission.shared.withSlot {
             try await self.startInternal(container: container)
+        }
+    }
+
+    /// Refuses to boot a container whose disk-image volume another running container has
+    /// mounted — see `ExclusiveVolumeUse`.
+    private func checkExclusiveVolumes(_ container: ContainerSnapshot) async throws {
+        guard !ExclusiveVolumeUse.diskImageVolumes(of: container).isEmpty else { return }
+        let all = try await containerClient.withClient { try await $0.list() }
+        if let conflict = ExclusiveVolumeUse.conflict(for: container, among: all) {
+            throw conflict
         }
     }
 
@@ -550,6 +562,8 @@ struct ClientContainerService: ClientContainerProtocol {
         let wasRunning = container.status == .running
         if wasRunning {
             await ContainerRestartState.shared.markExplicitlyStopped(id: container.id)
+        } else {
+            try await checkExclusiveVolumes(container)
         }
 
         // Hold a single slot across stop+start: acquiring separately would let other queued

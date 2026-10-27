@@ -63,6 +63,8 @@ extension ContainerStartRoute {
                     req.logger.debug("Started container \(id)")
                 }
 
+            } catch let conflict as ExclusiveVolumeInUseError {
+                throw conflict
             } catch {
                 // Check if error indicates container is already running/bootstrapped
                 let errorMessage = error.localizedDescription
