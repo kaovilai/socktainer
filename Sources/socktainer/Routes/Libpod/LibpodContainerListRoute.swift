@@ -14,7 +14,8 @@ struct LibpodContainerListRoute: RouteCollection {
                 let started = container.startedDate ?? AppleContainerTimestampResolver.containerCreationDate(container)
                 if let started { startedAt[DockerContainerID.hexId(for: container)] = started.timeIntervalSince1970 }
             }
-            return LibpodSchema.containerList(body, startedAt: startedAt)
+            let podNames = Dictionary(await PodStore.shared.all().map { ($0.id, $0.name) }, uniquingKeysWith: { first, _ in first })
+            return LibpodSchema.containerList(body, startedAt: startedAt, podNames: podNames)
         }
         try routes.registerVersionedRoute(.GET, pattern: "/libpod/containers/json", use: handler)
     }
