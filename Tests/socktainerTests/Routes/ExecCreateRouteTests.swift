@@ -120,7 +120,110 @@ struct ExecCreateRouteBodySizeTests {
     }
 }
 
+/// Docker refuses to exec into a paused container (409 "Container <id> is paused, unpause the
+/// container before exec"); podman refuses with its "container state improper" texts. Before the
+/// check socktainer ran the exec against processes stopped by SIGSTOP.
+@Suite("ExecRoute — paused container")
+struct ExecPausedContainerTests {
+    @Test("exec create in a paused container is a 409 with Docker's message")
+    func createRefusedWhenPaused() async throws {
+        let state = ContainerPauseState()
+        state.markPaused(RunningContainerMock().snapshot)
+        try await withPausedContainerApp(state: state) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/running-ctr/exec",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Cmd":["echo","hi"]}"#)
+            ) { res async in
+                #expect(res.status == .conflict)
+                #expect(res.body.string.contains("is paused, unpause the container before exec"))
+            }
+        }
+    }
+
+    @Test("libpod exec create in a paused container is a 409 with podman's message")
+    func libpodCreateRefusedWhenPaused() async throws {
+        let state = ContainerPauseState()
+        state.markPaused(RunningContainerMock().snapshot)
+        try await withPausedContainerApp(state: state) { app in
+            try await app.testing().test(
+                .POST, "/v5.0.0/libpod/containers/running-ctr/exec",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Cmd":["echo","hi"]}"#)
+            ) { res async in
+                #expect(res.status == .conflict)
+                #expect(res.body.string.contains("can only create exec sessions on running containers: container state improper"))
+            }
+        }
+    }
+
+    @Test("starting an exec created before the container was paused is a 409")
+    func startRefusedWhenPaused() async throws {
+        let state = ContainerPauseState()
+        let config = ExecManager.ExecConfig(
+            containerId: "running-ctr", cmd: ["echo", "hi"], attachStdin: false, attachStdout: true,
+            attachStderr: true, tty: false, detach: false, env: [], user: nil, workingDir: nil)
+        let execId = await ExecManager.shared.create(config: config)
+        state.markPaused(RunningContainerMock().snapshot)
+        try await withPausedContainerApp(state: state) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/exec/\(execId)/start",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Detach":true}"#)
+            ) { res async in
+                #expect(res.status == .conflict)
+                #expect(res.body.string.contains("is paused, unpause the container before exec"))
+            }
+        }
+        #expect(await ExecManager.shared.isRunning(id: execId) == false)
+        await ExecManager.shared.remove(id: execId)
+    }
+
+    @Test("an unpaused container still accepts exec create")
+    func createAllowedAfterUnpause() async throws {
+        let state = ContainerPauseState()
+        state.markPaused(RunningContainerMock().snapshot)
+        state.markUnpaused(id: "running-ctr")
+        try await withPausedContainerApp(state: state) { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/running-ctr/exec",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Cmd":["echo","hi"]}"#)
+            ) { res async throws in
+                #expect(res.status == .created)
+                let created = try JSONDecoder().decode(CreateExecResponse.self, from: Data(buffer: res.body))
+                await ExecManager.shared.remove(id: created.Id)
+            }
+        }
+    }
+}
+
 // MARK: - Helpers
+
+private struct LibpodExecCreateWithState: RouteCollection {
+    let client: ClientContainerProtocol
+    let state: ContainerPauseState
+
+    func boot(routes: RoutesBuilder) throws {
+        try routes.registerVersionedRoute(
+            .POST, pattern: "/libpod/containers/{id}/exec", use: ExecRoute.createExec(client: client, pauseState: state))
+    }
+}
+
+private func withPausedContainerApp(
+    state: ContainerPauseState,
+    test: @escaping (Application) async throws -> Void
+) async throws {
+    try await withApp(configure: { _ in }) { app in
+        let regexRouter = app.regexRouter(with: app.logger)
+        app.setRegexRouter(regexRouter)
+        regexRouter.installMiddleware(on: app)
+        app.storage[EventBroadcasterKey.self] = EventBroadcaster()
+        try app.register(collection: ExecRoute(client: RunningContainerMock(), pauseState: state))
+        try app.register(collection: LibpodExecCreateWithState(client: RunningContainerMock(), state: state))
+        try await test(app)
+    }
+}
 
 private func withRunningContainerApp(
     test: @escaping (Application) async throws -> Void
@@ -155,7 +258,7 @@ private func withRunningContainerApp(
 /// Mock whose getContainer always returns a running snapshot, so createExec
 /// reaches the request-body validation.
 private struct RunningContainerMock: ClientContainerProtocol {
-    private var snapshot: ContainerSnapshot {
+    var snapshot: ContainerSnapshot {
         let proc = ProcessConfiguration(
             executable: "/bin/sh", arguments: [], environment: [],
             workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0)

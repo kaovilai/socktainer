@@ -99,11 +99,12 @@ struct CreateExecResponse: Content {
 
 struct ExecRoute: RouteCollection {
     let client: ClientContainerProtocol
+    var pauseState: ContainerPauseState = .shared
 
     func boot(routes: RoutesBuilder) throws {
-        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/exec", use: ExecRoute.createExec(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/containers/{id}/exec", use: ExecRoute.createExec(client: client, pauseState: pauseState))
         try routes.registerVersionedRoute(.GET, pattern: "/exec/{id}/json", use: ExecRoute.inspectExec(client: client))
-        try routes.registerVersionedRoute(.POST, pattern: "/exec/{id}/start", use: ExecRoute.startExec(client: client))
+        try routes.registerVersionedRoute(.POST, pattern: "/exec/{id}/start", use: ExecRoute.startExec(client: client, pauseState: pauseState))
         try routes.registerVersionedRoute(.POST, pattern: "/exec/{id}/resize", use: ExecRoute.resizeExec)
     }
 
@@ -171,7 +172,22 @@ struct ExecRoute: RouteCollection {
         }
     }
 
-    static func createExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
+    /// Docker refuses to create or start an exec in a paused container (moby daemon/exec.go,
+    /// errExecPaused); podman refuses any exec session on a container that is not running, and a
+    /// paused one is not. Without this the exec would run against processes stopped by SIGSTOP.
+    static func pausedConflict(_ container: ContainerSnapshot, pauseState: ContainerPauseState, req: Request, starting: Bool) -> Abort? {
+        guard pauseState.isPaused(container) else { return nil }
+        if DockerErrorMiddleware.isLibpod(req) {
+            let reason =
+                starting
+                ? "can only start exec sessions when their container is running: container state improper"
+                : "can only create exec sessions on running containers: container state improper"
+            return Abort(.conflict, reason: reason)
+        }
+        return Abort(.conflict, reason: "Container \(DockerContainerID.hexId(for: container)) is paused, unpause the container before exec")
+    }
+
+    static func createExec(client: ClientContainerProtocol, pauseState: ContainerPauseState = .shared) -> @Sendable (Request) async throws -> Response {
         { req in
 
             guard let containerId = req.parameters.get("id") else {
@@ -214,6 +230,9 @@ struct ExecRoute: RouteCollection {
                 try client.enforceContainerRunning(container: container)
             } catch {
                 throw Abort(.conflict, reason: "Container is not running")
+            }
+            if let conflict = pausedConflict(container, pauseState: pauseState, req: req, starting: false) {
+                throw conflict
             }
 
             // there is an error if we provides attachStderr with terminal true
@@ -270,7 +289,7 @@ struct ExecRoute: RouteCollection {
         }
     }
 
-    static func startExec(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
+    static func startExec(client: ClientContainerProtocol, pauseState: ContainerPauseState = .shared) -> @Sendable (Request) async throws -> Response {
         { req in
             guard let execId = req.parameters.get("id") else {
                 throw Abort(.badRequest, reason: "Missing exec ID")
@@ -287,6 +306,9 @@ struct ExecRoute: RouteCollection {
             }
 
             try client.enforceContainerRunning(container: container)
+            if let conflict = pausedConflict(container, pauseState: pauseState, req: req, starting: true) {
+                throw conflict
+            }
 
             // Apply the request's Env/User/WorkingDir before marking the exec
             // started: applying them can throw, and doing so after markStarted
