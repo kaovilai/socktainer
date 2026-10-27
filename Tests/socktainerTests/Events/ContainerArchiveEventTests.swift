@@ -174,7 +174,7 @@ private struct FakeArchiveClient: ClientArchiveProtocol {
 
     func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws {}
 
-    func exportRootfs(containerId: String) async throws -> URL {
+    func exportRootfs(container: ContainerSnapshot) async throws -> URL {
         throw ClientArchiveError.operationFailed(message: "not under test")
     }
 }

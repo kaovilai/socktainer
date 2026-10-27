@@ -36,7 +36,7 @@ struct ContainerExportRoute: RouteCollection {
 
             let tarPath: URL
             do {
-                tarPath = try await archiveClient.exportRootfs(containerId: container.id)
+                tarPath = try await archiveClient.exportRootfs(container: container)
             } catch let error as ClientArchiveError {
                 switch error {
                 case .rootfsNotFound:
