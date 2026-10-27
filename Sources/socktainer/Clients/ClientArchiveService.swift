@@ -144,8 +144,8 @@ protocol ClientArchiveProtocol: Sendable {
     func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws
 
     /// Export the container's entire root filesystem as an uncompressed tar
-    /// (docker export). The caller owns the returned file and deletes it when done.
-    func exportRootfs(containerId: String) async throws -> URL
+    /// (docker export, docker commit). The caller owns the returned file and deletes it when done.
+    func exportRootfs(container: ContainerSnapshot) async throws -> URL
 }
 
 /// Service for performing archive operations on container filesystems
@@ -483,8 +483,14 @@ struct ClientArchiveService: ClientArchiveProtocol {
     /// snapshot — the same guarantee moby gives when exporting a running
     /// container's mounted layer. The export runs detached because it is
     /// synchronous I/O that can take minutes for large filesystems.
-    func exportRootfs(containerId: String) async throws -> URL {
-        let rootfsPath = getRootfsPath(containerId: containerId)
+    ///
+    /// A running guest's recent writes are flushed first (as `docker cp` does), so a
+    /// file written just before `docker export`/`docker commit` is in the tar; a
+    /// never-started container exports its image snapshot.
+    func exportRootfs(container: ContainerSnapshot) async throws -> URL {
+        let containerId = container.id
+        await flushIfRunning(container)
+        let rootfsPath = try resolveRootfsPath(container: container)
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
             throw ClientArchiveError.rootfsNotFound(id: containerId)
         }
