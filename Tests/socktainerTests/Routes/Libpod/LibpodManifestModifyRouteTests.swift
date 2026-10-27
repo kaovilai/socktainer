@@ -1,3 +1,4 @@
+import ContainerizationError
 import ContainerizationOCI
 import Foundation
 import Testing
@@ -150,13 +151,68 @@ struct LibpodManifestModifyRouteTests {
         #expect(await removedDigests.get() == [])
     }
 
-    @Test("operation=annotate is not implemented")
-    func annotateIsNotImplemented() async throws {
-        let client = MockManifestClient()
+    @Test("operation=annotate applies podman's JSON body to each listed instance")
+    func annotateAppliesBodyToInstance() async throws {
+        let received = Box<[String: ManifestAnnotation]>([:])
+        let client = MockManifestClient(annotateHandler: { _, instance, annotation in
+            var seen = await received.get()
+            seen[instance] = annotation
+            await received.set(seen)
+            return "sha256:annotated"
+        })
+
+        // Exactly what podman 6's bindings send: Go field names, no Content-Type.
+        let body = #"{"Operation":"annotate","Annotations":{"k":"v"},"Arch":"arm64","Variant":"v8","OS":"linux","os_version":"1","os_features":["f"],"Images":["sha256:abc"]}"#
+        try await withModifyApp(client: client) { app in
+            try await app.testing().test(
+                .PUT, "/v1.51/libpod/manifests/mylist?operation=annotate&images=sha256:abc",
+                beforeRequest: { req in req.body = ByteBuffer(string: body) }
+            ) { res async throws in
+                #expect(res.status == .ok)
+                let decoded = try JSONDecoder().decode(RESTManifestIDResponse.self, from: Data(buffer: res.body))
+                #expect(decoded.ID == "sha256:annotated")
+            }
+        }
+        let annotation = try #require(await received.get()["sha256:abc"])
+        #expect(
+            annotation
+                == ManifestAnnotation(
+                    architecture: "arm64", os: "linux", osVersion: "1", variant: "v8", osFeatures: ["f"], annotations: ["k": "v"]))
+    }
+
+    @Test("operation=annotate with podman's --index empty instance targets the index")
+    func annotateIndexTargetsEmptyInstance() async throws {
+        let instances = Box<[String]>([])
+        let client = MockManifestClient(annotateHandler: { _, instance, annotation in
+            #expect(annotation.indexAnnotations == ["org.example": "yes"])
+            await instances.set(await instances.get() + [instance])
+            return "sha256:annotated"
+        })
+
+        let body = #"{"Operation":"annotate","index_annotations":{"org.example":"yes"},"Images":[""]}"#
+        try await withModifyApp(client: client) { app in
+            try await app.testing().test(
+                .PUT, "/v1.51/libpod/manifests/mylist?operation=annotate",
+                beforeRequest: { req in req.body = ByteBuffer(string: body) }
+            ) { res async throws in
+                #expect(res.status == .ok)
+            }
+        }
+        #expect(await instances.get() == [""])
+    }
+
+    @Test("operation=annotate rejecting the request surfaces as 400")
+    func annotateInvalidArgumentIs400() async throws {
+        let client = MockManifestClient(annotateHandler: { _, _, _ in
+            throw ContainerizationError(.invalidArgument, message: "sha256:abc is not a member of mylist")
+        })
 
         try await withModifyApp(client: client) { app in
-            try await app.testing().test(.PUT, "/v1.51/libpod/manifests/mylist?operation=annotate") { res async throws in
-                #expect(res.status == .notImplemented)
+            try await app.testing().test(
+                .PUT, "/v1.51/libpod/manifests/mylist?operation=annotate&images=sha256:abc",
+                beforeRequest: { req in req.body = ByteBuffer(string: #"{"Arch":"amd64"}"#) }
+            ) { res async throws in
+                #expect(res.status == .badRequest)
             }
         }
     }

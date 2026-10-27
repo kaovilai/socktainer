@@ -39,6 +39,8 @@ protocol ClientManifestServiceProtocol: Sendable {
     func removeDigests(name: String, digests: [String]) async throws -> String
     @discardableResult
     func addBuiltImage(name: String, builtReference: String, logger: Logger) async throws -> String
+    @discardableResult
+    func annotate(name: String, instance: String, annotation: ManifestAnnotation, logger: Logger) async throws -> String
     func delete(name: String) async throws
     func retagForPush(name: String, destination: String) async throws -> (reference: String, priorState: RetagState?)
     func untagPushDestination(_ state: RetagState) async throws
@@ -251,6 +253,35 @@ struct ClientManifestService: ClientManifestServiceProtocol {
         return try await writeIndexAndTag(name: name, manifests: manifests)
     }
 
+    /// `podman manifest annotate <name> <instance>` / the "annotate" operation of
+    /// `PUT /libpod/manifests/{name}`. `instance` is a member digest or an image whose
+    /// manifest is a member (podman's `digestFromDigestOrManifestListMember`); empty means
+    /// the index itself (`--index`).
+    @discardableResult
+    func annotate(name: String, instance: String, annotation: ManifestAnnotation, logger: Logger) async throws -> String {
+        let index = try await inspect(name: name)
+        var instanceDigest: String? = nil
+        if !instance.isEmpty {
+            instanceDigest = try await memberDigest(for: instance, in: index, name: name, logger: logger)
+        }
+        return try await writeIndexAndTag(name: name, index: annotation.apply(to: index, instanceDigest: instanceDigest))
+    }
+
+    private func memberDigest(for instance: String, in index: Index, name: String, logger: Logger) async throws -> String {
+        let members = Set(index.manifests.map(\.digest))
+        if instance.wholeMatch(of: /(sha256:)?[a-fA-F0-9]{64}/) != nil {
+            let digest = try Self.normalizedDigest(instance)
+            guard members.contains(digest) else {
+                throw ContainerizationError(.invalidArgument, message: "\(digest) is not a member of \(name)")
+            }
+            return digest
+        }
+        guard let digest = try await leafDescriptors(for: instance, logger: logger).map(\.digest).first(where: members.contains) else {
+            throw ContainerizationError(.invalidArgument, message: "no manifest of \(instance) is a member of \(name)")
+        }
+        return digest
+    }
+
     /// Shared by `add`/`addBuiltImage`: an absent manifest list starts from an empty index (matching
     /// real podman's "creates a manifest list if it does not exist" semantics), but any other
     /// failure (a corrupt/undecodable existing index, a storage I/O error, etc.) must propagate —
@@ -410,8 +441,12 @@ struct ClientManifestService: ClientManifestServiceProtocol {
     /// this type's doc comment.
     @discardableResult
     private func writeIndexAndTag(name: String, manifests: [Descriptor]) async throws -> String {
+        try await writeIndexAndTag(name: name, index: Index(manifests: manifests))
+    }
+
+    @discardableResult
+    private func writeIndexAndTag(name: String, index: Index) async throws -> String {
         let normalized = try ClientImage.normalizeReference(name, containerSystemConfig: containerSystemConfig)
-        let index = Index(manifests: manifests)
         let data = try JSONEncoder().encode(index)
 
         // Computed independently rather than captured from inside the ingest closure
