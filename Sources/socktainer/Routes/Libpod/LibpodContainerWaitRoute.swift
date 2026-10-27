@@ -1,3 +1,4 @@
+import ContainerResource
 import Vapor
 
 struct LibpodContainerWaitRoute: RouteCollection {
@@ -7,46 +8,130 @@ struct LibpodContainerWaitRoute: RouteCollection {
         try routes.registerVersionedRoute(.POST, pattern: "/libpod/containers/{id}/wait", use: LibpodContainerWaitRoute.handler(client: client))
     }
 
-    /// Delegates to the Docker-compat wait — which also resolves a container that already exited
-    /// before `/wait` arrived (the usual order for `podman run`) — then answers with the bare
-    /// integer exit code podman's binding decodes, not Docker's `{"StatusCode": N}` object.
-    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
-        LibpodAdapter.reshaping(
-            ContainerWaitRoute.handler(client: client),
-            prepare: { req in
-                if let raw = req.query["condition"] as String? {
-                    LibpodAdapter.setQuery(req, "condition", to: try mapLibpodCondition(raw).rawValue)
-                }
-                return req
-            }
-        ) { body, _ in
-            (body as? [String: Any])?["StatusCode"] ?? 0
+    /// One condition of podman's libpod `wait`. Real podman names the container's own lowercase
+    /// statuses ("configured", "created", "running", "paused", "exited", "stopped", "removing",
+    /// ...) plus "healthy"/"unhealthy", not Docker compat's `wait` vocabulary.
+    enum Condition: Equatable, Sendable {
+        /// Answered with the exit code, through the Docker-compat wait.
+        case exit(ContainerWaitCondition)
+        /// Answered with -1 once the container is in the state, as podman does.
+        case state(State)
+    }
+
+    enum State: String, Equatable, Sendable {
+        case running, created, healthy, unhealthy
+    }
+
+    /// Poll interval for state conditions; podman's own default.
+    static let statePollIntervalNs: UInt64 = 250_000_000
+
+    /// Every `condition` value (repeatable, and comma-separated for good measure); podman waits for
+    /// the container to stop when none is given.
+    static func conditions(from req: Request) throws -> [Condition] {
+        let items = URLComponents(string: "?" + (req.url.query ?? ""))?.queryItems ?? []
+        let raw = items.filter { $0.name == "condition" }.compactMap(\.value)
+            .flatMap { $0.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) } }
+            .filter { !$0.isEmpty }
+        guard !raw.isEmpty else { return [.exit(.notRunning)] }
+        return try raw.map(mapLibpodCondition)
+    }
+
+    /// "removing" (in-progress removal) maps to Docker-compat's `removed`, since this daemon has no
+    /// distinct in-progress-removal state to block on; "configured" is a never-started container.
+    static func mapLibpodCondition(_ raw: String) throws -> Condition {
+        switch raw {
+        case "stopped", "exited":
+            return .exit(.notRunning)
+        case "removed", "removing":
+            return .exit(.removed)
+        case "running":
+            return .state(.running)
+        case "created", "configured":
+            return .state(.created)
+        case "healthy":
+            return .state(.healthy)
+        case "unhealthy":
+            return .state(.unhealthy)
+        case "paused", "stopping", "unknown":
+            throw Abort(.notImplemented, reason: "waiting for condition '\(raw)' is not supported")
+        default:
+            throw Abort(.badRequest, reason: "Invalid wait condition: \(raw)")
         }
     }
 
-    /// Real podman's libpod `wait` endpoint (`condition=`, repeatable) uses the container's
-    /// own lowercase status names ("configured", "created", "running", "paused", "exited",
-    /// "stopped", "removing", ...), not Docker compat's `wait`-specific vocabulary
-    /// (`ContainerWaitCondition`: "not-running", "next-exit", "removed", "healthy"). "removing"
-    /// (in-progress removal) maps to the same `.removed` condition as Docker-compat's "removed"
-    /// since this daemon has no distinct in-progress-removal state to block on. Only
-    /// the first `condition` value is honored — real podman lets multiple be OR-matched,
-    /// which would need genuine target-state polling this daemon's `client.wait` doesn't
-    /// implement (it only supports "block until the container stops and report its exit
-    /// code," matching Docker's own `wait`).
-    static func mapLibpodCondition(_ raw: String) throws -> ContainerWaitCondition {
-        let first = raw.split(separator: ",").first.map(String.init) ?? raw
-        switch first {
-        case "stopped", "exited":
-            return .notRunning
-        case "removed", "removing":
-            return .removed
-        case "healthy":
-            return .healthy
-        case "running", "paused", "created", "configured":
-            throw Abort(.notImplemented, reason: "waiting for condition '\(first)' is not supported; only 'stopped'/'exited' (and Docker-compat 'removed'/'healthy') are")
-        default:
-            throw Abort(.badRequest, reason: "Invalid wait condition: \(first)")
+    /// Waits until any of the conditions holds — podman ORs them — and answers with the bare
+    /// integer podman's binding decodes, not Docker's `{"StatusCode": N}` object: the exit code
+    /// for an exit condition, -1 for a state. The Docker-compat wait also resolves a container
+    /// that already exited before `/wait` arrived (the usual order for `podman run`).
+    static func handler(client: ClientContainerProtocol) -> @Sendable (Request) async throws -> Response {
+        { req in
+            guard let reference = req.parameters.get("id") else {
+                throw Abort(.badRequest, reason: "Missing container ID")
+            }
+            let conditions = try conditions(from: req)
+            let container = try await ContainerWaitRoute.preflight(client: client, reference: reference)
+            let nativeId = container.id
+            if conditions.contains(where: { $0 == .state(.healthy) || $0 == .state(.unhealthy) }),
+                container.configuration.labels[HealthCheckManager.healthcheckLabel] == nil
+            {
+                throw Abort(.internalServerError, reason: "cannot use a health condition: container \(nativeId) has no healthcheck")
+            }
+
+            var pending: [(ContainerWaitCondition, ContainerWaitRoute.PendingWait)] = []
+            for case .exit(let condition) in conditions where !pending.contains(where: { $0.0 == condition }) {
+                pending.append((condition, await ContainerWaitRoute.PendingWait.begin(condition: condition, nativeId: nativeId, app: req.application)))
+            }
+            let states = Set(conditions.compactMap { if case .state(let state) = $0 { state } else { nil } })
+            let app = req.application
+
+            let code: Int64 = await withTaskGroup(of: Int64?.self) { group in
+                for (condition, begun) in pending {
+                    group.addTask {
+                        await ContainerWaitRoute.waitResult(
+                            condition: condition, containerId: nativeId, nativeId: nativeId, client: client, app: app, pending: begun
+                        ).StatusCode
+                    }
+                }
+                if !states.isEmpty {
+                    group.addTask { await stateReached(states, nativeId: nativeId, client: client, app: app) }
+                }
+                for await result in group {
+                    if let result {
+                        group.cancelAll()
+                        return result
+                    }
+                }
+                return -1
+            }
+            return try LibpodAdapter.jsonResponse(code)
         }
+    }
+
+    /// Polls until the container is in one of `states` (-1), it is gone (-1, as podman reports a
+    /// container that vanished), or the task is cancelled (nil).
+    static func stateReached(
+        _ states: Set<State>, nativeId: String, client: ClientContainerProtocol, app: Application
+    ) async -> Int64? {
+        while !Task.isCancelled {
+            do {
+                guard let container = try await client.getContainer(id: nativeId) else { return -1 }
+                if states.contains(.running), container.status == .running { return -1 }
+                if states.contains(.created), container.isNeverStarted { return -1 }
+                if states.contains(.healthy) || states.contains(.unhealthy),
+                    let status = await app.storage[HealthCheckManagerKey.self]?.currentHealth(for: nativeId)?.Status,
+                    let health = State(rawValue: status), states.contains(health)
+                {
+                    return -1
+                }
+            } catch {
+                // A failed lookup is not a removal; poll again.
+            }
+            do {
+                try await Task.sleep(nanoseconds: statePollIntervalNs)
+            } catch {
+                return nil
+            }
+        }
+        return nil
     }
 }
