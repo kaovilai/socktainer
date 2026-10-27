@@ -29,12 +29,16 @@ protocol ClientImageCommitProtocol: Sendable {
         comment: String?,
         author: String?,
         configJSON: Data,
+        base: CommitBase?,
         platform: Platform,
         appleContainerAppSupportUrl: URL,
         logger: Logger
     ) async throws -> (reference: String?, digest: String)
 
     func rawImageConfig(reference: String, platform: Platform, appleContainerAppSupportUrl: URL) async throws -> Data
+
+    /// The manifest `manifestDigest` and its config, provided every layer it lists is in the store.
+    func commitBase(manifestDigest: String, appleContainerAppSupportUrl: URL) async throws -> CommitBase
 }
 
 protocol ClientImageProtocol: Sendable {
@@ -841,8 +845,11 @@ struct ClientImageService: ClientImageProtocol, ClientImageCommitProtocol {
         try encoder.encode(Index(schemaVersion: 2, manifests: saved)).write(to: out.appendingPathComponent("index.json"))
     }
 
-    /// `docker commit`: same as `importImage`, but the config is the commit's composed
-    /// config object (`CommitConfigComposer`) rather than one built from `changes`.
+    /// `docker commit`: with a `base`, `tarPath` holds only the container's changes and
+    /// becomes one layer over the base image's (`buildLayeredOCILayout`). Without one it is
+    /// the container's whole filesystem, committed as a single squashed layer the way
+    /// `importImage` does it. Either way the config is the commit's composed config object
+    /// (`CommitConfigComposer`) rather than one built from `changes`.
     func commitImage(
         tarPath: URL,
         repo: String?,
@@ -850,6 +857,7 @@ struct ClientImageService: ClientImageProtocol, ClientImageCommitProtocol {
         comment: String?,
         author: String?,
         configJSON: Data,
+        base: CommitBase?,
         platform: Platform,
         appleContainerAppSupportUrl: URL,
         logger: Logger
@@ -866,16 +874,29 @@ struct ClientImageService: ClientImageProtocol, ClientImageCommitProtocol {
         let ociLayoutPath = tempDir.appendingPathComponent("oci-layout")
         try FileManager.default.createDirectory(at: ociLayoutPath, withIntermediateDirectories: true)
 
-        _ = try ContainerImageUtility.buildSingleLayerOCILayout(
-            tarPath: tarPath,
-            ociLayoutPath: ociLayoutPath,
-            platform: platform,
-            configDict: configDict,
-            message: comment,
-            author: author,
-            reference: reference,
-            logger: logger
-        )
+        if let base {
+            _ = try ContainerImageUtility.buildLayeredOCILayout(
+                changeTarPath: tarPath,
+                base: base,
+                ociLayoutPath: ociLayoutPath,
+                configDict: configDict,
+                message: comment,
+                author: author,
+                reference: reference,
+                logger: logger
+            )
+        } else {
+            _ = try ContainerImageUtility.buildSingleLayerOCILayout(
+                tarPath: tarPath,
+                ociLayoutPath: ociLayoutPath,
+                platform: platform,
+                configDict: configDict,
+                message: comment,
+                author: author,
+                reference: reference,
+                logger: logger
+            )
+        }
 
         let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
         let images = try await imageStore.load(from: ociLayoutPath, progress: nil)
@@ -885,6 +906,28 @@ struct ClientImageService: ClientImageProtocol, ClientImageCommitProtocol {
 
         logger.info("Committed image \(image.reference) (\(image.digest))")
         return (reference, image.digest)
+    }
+
+    func commitBase(manifestDigest: String, appleContainerAppSupportUrl: URL) async throws -> CommitBase {
+        let contentRoot = appleContainerAppSupportUrl.appendingPathComponent("content")
+        let content = try LocalContentStore(path: contentRoot)
+        guard let manifestBlob = try await content.get(digest: manifestDigest) else {
+            throw ClientImageError.notFound(id: manifestDigest)
+        }
+        let manifestData = try manifestBlob.data()
+        guard let manifest = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
+            let configDigest = (manifest["config"] as? [String: Any])?["digest"] as? String,
+            let configBlob = try await content.get(digest: configDigest)
+        else {
+            throw ClientImageError.notFound(id: "config of \(manifestDigest)")
+        }
+        let base = CommitBase(manifestDigest: manifestDigest, manifest: manifestData, config: try configBlob.data(), contentRoot: contentRoot)
+        for layer in try base.layers() {
+            guard let digest = layer["digest"] as? String, try await content.get(digest: digest) != nil else {
+                throw ClientImageError.notFound(id: "layer \(layer["digest"] ?? "?") of \(manifestDigest)")
+            }
+        }
+        return base
     }
 
     /// The raw config blob of `reference`'s manifest for `platform` — `docker commit`

@@ -15,9 +15,10 @@ struct RESTCommitQuery: Content {
 
 /// `docker commit`: snapshots a container's filesystem into a new image.
 ///
-/// The container's rootfs is exported as a single layer (squashed, unlike moby's
-/// base-layers-plus-diff: Apple Container keeps no separate writable layer to diff), and the
-/// config is composed by `CommitConfigComposer`. A running container is not paused (no
+/// Like moby, the new image is the base image's layers plus one layer of the container's
+/// changes (`RootfsDiff` against the image snapshot the rootfs was cloned from). When the
+/// changes cannot be separated from the image, the whole rootfs is committed as a single
+/// squashed layer instead. The config is composed by `CommitConfigComposer`. A running container is not paused (no
 /// pause primitive); its guest page cache is flushed before the rootfs is read, the same
 /// volatile-snapshot guarantee `docker export` gives.
 struct CommitRoute: RouteCollection {
@@ -98,10 +99,20 @@ struct CommitRoute: RouteCollection {
         }
 
         let platform = container.configuration.platform
+        let layered = await changeLayer(
+            of: container, archiveClient: archiveClient, imageClient: imageClient, appSupport: appSupport, logger: req.logger)
+        defer {
+            if let layered { try? FileManager.default.removeItem(at: layered.layer.tarPath) }
+        }
+
         // A base image deleted since the container was created leaves only what the
         // container itself records.
         let base: [String: Any]
-        if let raw = try? await imageClient.rawImageConfig(
+        if let layered,
+            let object = try? JSONSerialization.jsonObject(with: layered.base.config) as? [String: Any]
+        {
+            base = object["config"] as? [String: Any] ?? [:]
+        } else if let raw = try? await imageClient.rawImageConfig(
             reference: container.configuration.image.reference, platform: platform, appleContainerAppSupportUrl: appSupport),
             let object = try? JSONSerialization.jsonObject(with: raw) as? [String: Any]
         {
@@ -133,15 +144,21 @@ struct CommitRoute: RouteCollection {
         let configJSON = try JSONSerialization.data(withJSONObject: composed)
 
         let tarPath: URL
-        do {
-            tarPath = try await archiveClient.exportRootfs(container: container)
-        } catch let error as ClientArchiveError {
-            if case .rootfsNotFound = error {
-                throw Abort(.notFound, reason: error.localizedDescription)
+        if let layered {
+            tarPath = layered.layer.tarPath
+        } else {
+            do {
+                tarPath = try await archiveClient.exportRootfs(container: container)
+            } catch let error as ClientArchiveError {
+                if case .rootfsNotFound = error {
+                    throw Abort(.notFound, reason: error.localizedDescription)
+                }
+                throw Abort(.internalServerError, reason: "Error committing container \(commit.container): \(error.localizedDescription)")
             }
-            throw Abort(.internalServerError, reason: "Error committing container \(commit.container): \(error.localizedDescription)")
         }
-        defer { try? FileManager.default.removeItem(at: tarPath) }
+        defer {
+            if layered == nil { try? FileManager.default.removeItem(at: tarPath) }
+        }
 
         let repo = commit.repo?.isEmpty == false ? commit.repo : nil
         let tag = commit.tag?.isEmpty == false ? commit.tag : nil
@@ -154,6 +171,7 @@ struct CommitRoute: RouteCollection {
                 comment: commit.comment,
                 author: commit.author,
                 configJSON: configJSON,
+                base: layered?.base,
                 platform: platform,
                 appleContainerAppSupportUrl: appSupport,
                 logger: req.logger
@@ -166,6 +184,38 @@ struct CommitRoute: RouteCollection {
             await broadcaster.broadcast(commitEvent(container: container, imageId: digest, repo: repo, tag: tag, comment: commit.comment))
         }
         return digest
+    }
+
+    /// The container's changes as a layer over its image's own layers, as moby commits. Nil —
+    /// logged, and committed squashed instead — when the changes cannot be separated from the
+    /// image (never started, or the image snapshot is gone) or the image's layers are no
+    /// longer all in the store.
+    static func changeLayer(
+        of container: ContainerSnapshot,
+        archiveClient: ClientArchiveProtocol,
+        imageClient: ClientImageCommitProtocol,
+        appSupport: URL,
+        logger: Logger
+    ) async -> (layer: CommitChangeLayer, base: CommitBase)? {
+        let layer: CommitChangeLayer
+        do {
+            guard let exported = try await archiveClient.exportChangeLayer(container: container) else {
+                logger.info("Committing \(container.id) as a single squashed layer: its image snapshot is unavailable")
+                return nil
+            }
+            layer = exported
+        } catch {
+            logger.warning("Committing \(container.id) as a single squashed layer: \(error)")
+            return nil
+        }
+        do {
+            let base = try await imageClient.commitBase(manifestDigest: layer.baseManifestDigest, appleContainerAppSupportUrl: appSupport)
+            return (layer, base)
+        } catch {
+            try? FileManager.default.removeItem(at: layer.tarPath)
+            logger.warning("Committing \(container.id) as a single squashed layer: base image \(layer.baseManifestDigest) is incomplete: \(error)")
+            return nil
+        }
     }
 
     /// moby's container `commit` event: the comment, the new image's id, and the reference it
