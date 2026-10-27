@@ -42,6 +42,50 @@ struct CommitRouteTests {
         #expect(await archive.exportedIds() == ["web"])
     }
 
+    @Test("commits only the container's changes as a layer over the manifest its rootfs came from")
+    func commitsChangeLayer() async throws {
+        let images = RecordingCommitClient(
+            baseConfig: #"{"config":{"Cmd":["/bin/retagged"]}}"#,
+            layeredBaseConfig: #"{"config":{"Cmd":["/bin/sh"]},"rootfs":{"type":"layers","diff_ids":["sha256:aa"]}}"#)
+        let archive = CommitArchiveClient(changeLayerBase: "sha256:base")
+        let snapshot = try makeContainerSnapshot(nativeId: "web", ip: "192.168.65.2", network: "bridge", labels: [:], status: .running)
+
+        try await withCommitApp(snapshot: snapshot, archive: archive, images: images) { app in
+            try await app.testing().test(.POST, "/v1.51/commit?container=web&repo=io-layered") { res async throws in
+                #expect(res.status == .created)
+            }
+        }
+
+        let call = try #require(await images.lastCall())
+        #expect(call.tarContents == "changes-of-web")
+        #expect(call.baseManifestDigest == "sha256:base")
+        // The config comes from the exact manifest the rootfs was cloned from, not from
+        // whatever the image reference points at now.
+        let config = try #require(try JSONSerialization.jsonObject(with: call.configJSON) as? [String: Any])
+        #expect(config["Cmd"] as? [String] == ["/bin/sh"])
+        #expect(await archive.exportedIds().isEmpty)
+        #expect(await archive.leftoverChangeLayers().isEmpty)
+    }
+
+    @Test("falls back to a squashed commit when the base image's layers are no longer in the store")
+    func squashesWithoutBaseLayers() async throws {
+        let images = RecordingCommitClient(baseConfig: #"{"config":{"Cmd":["/bin/sh"]}}"#)
+        let archive = CommitArchiveClient(changeLayerBase: "sha256:gone")
+        let snapshot = try makeContainerSnapshot(nativeId: "web", ip: "192.168.65.2", network: "bridge", labels: [:], status: .running)
+
+        try await withCommitApp(snapshot: snapshot, archive: archive, images: images) { app in
+            try await app.testing().test(.POST, "/v1.51/commit?container=web&repo=io-squashed") { res async throws in
+                #expect(res.status == .created)
+            }
+        }
+
+        let call = try #require(await images.lastCall())
+        #expect(call.tarContents == "rootfs-of-web")
+        #expect(call.baseManifestDigest == nil)
+        #expect(await archive.exportedIds() == ["web"])
+        #expect(await archive.leftoverChangeLayers().isEmpty)
+    }
+
     @Test("a commit broadcasts moby's container commit event with the comment, image id and reference")
     func broadcastsCommitEvent() async throws {
         let broadcaster = EventBroadcaster()
@@ -200,35 +244,71 @@ private actor RecordingCommitClient: ClientImageCommitProtocol {
         let author: String?
         let configJSON: Data
         let tarContents: String
+        let baseManifestDigest: String?
     }
 
     private let baseConfig: Data
     private let digest: String
+    /// The config of the manifest a change layer applies to; nil when its layers are missing.
+    private let layeredBaseConfig: Data?
     private var calls: [Call] = []
 
-    init(baseConfig: String, digest: String = "sha256:committed") {
+    init(baseConfig: String, digest: String = "sha256:committed", layeredBaseConfig: String? = nil) {
         self.baseConfig = Data(baseConfig.utf8)
         self.digest = digest
+        self.layeredBaseConfig = layeredBaseConfig.map { Data($0.utf8) }
     }
 
     func lastCall() -> Call? { calls.last }
 
     func commitImage(
-        tarPath: URL, repo: String?, tag: String?, comment: String?, author: String?, configJSON: Data, platform: Platform,
-        appleContainerAppSupportUrl: URL, logger: Logger
+        tarPath: URL, repo: String?, tag: String?, comment: String?, author: String?, configJSON: Data, base: CommitBase?,
+        platform: Platform, appleContainerAppSupportUrl: URL, logger: Logger
     ) async throws -> (reference: String?, digest: String) {
         let contents = try String(contentsOf: tarPath, encoding: .utf8)
-        calls.append(Call(repo: repo, tag: tag, comment: comment, author: author, configJSON: configJSON, tarContents: contents))
+        calls.append(
+            Call(
+                repo: repo, tag: tag, comment: comment, author: author, configJSON: configJSON, tarContents: contents,
+                baseManifestDigest: base?.manifestDigest))
         return (repo, digest)
     }
 
     func rawImageConfig(reference: String, platform: Platform, appleContainerAppSupportUrl: URL) async throws -> Data {
         baseConfig
     }
+
+    func commitBase(manifestDigest: String, appleContainerAppSupportUrl: URL) async throws -> CommitBase {
+        guard let layeredBaseConfig else {
+            throw ClientImageError.notFound(id: "layer of \(manifestDigest)")
+        }
+        return CommitBase(
+            manifestDigest: manifestDigest, manifest: Data(#"{"layers":[]}"#.utf8), config: layeredBaseConfig,
+            contentRoot: appleContainerAppSupportUrl)
+    }
 }
 
 private actor CommitArchiveClient: ClientArchiveProtocol {
     private var exported: [String] = []
+    private var changeLayerTars: [URL] = []
+    /// The manifest digest a change layer reports; nil when the image snapshot is unavailable.
+    private let changeLayerBase: String?
+
+    init(changeLayerBase: String? = nil) {
+        self.changeLayerBase = changeLayerBase
+    }
+
+    /// Change layer tars the route did not delete.
+    func leftoverChangeLayers() -> [URL] {
+        changeLayerTars.filter { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    func exportChangeLayer(container: ContainerSnapshot) async throws -> CommitChangeLayer? {
+        guard let changeLayerBase else { return nil }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("commit-layer-test-\(UUID().uuidString).tar")
+        try Data("changes-of-\(container.id)".utf8).write(to: url)
+        changeLayerTars.append(url)
+        return CommitChangeLayer(tarPath: url, baseManifestDigest: changeLayerBase)
+    }
 
     func exportedIds() -> [String] { exported }
 

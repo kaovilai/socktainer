@@ -146,6 +146,23 @@ protocol ClientArchiveProtocol: Sendable {
     /// Export the container's entire root filesystem as an uncompressed tar
     /// (docker export, docker commit). The caller owns the returned file and deletes it when done.
     func exportRootfs(container: ContainerSnapshot) async throws -> URL
+
+    /// `docker commit`: the container's changes as one layer over the image it was created
+    /// from, or nil when they cannot be told apart from it (never started, or its image
+    /// snapshot is gone). The caller owns `tarPath` and deletes it when done.
+    func exportChangeLayer(container: ContainerSnapshot) async throws -> CommitChangeLayer?
+}
+
+/// An uncompressed tar of a container's changes, in the OCI layer changeset format, and
+/// the image manifest it applies on top of.
+struct CommitChangeLayer: Sendable {
+    let tarPath: URL
+    /// `sha256:`-prefixed digest of the platform manifest the container's rootfs came from.
+    let baseManifestDigest: String
+}
+
+extension ClientArchiveProtocol {
+    func exportChangeLayer(container: ContainerSnapshot) async throws -> CommitChangeLayer? { nil }
 }
 
 /// Service for performing archive operations on container filesystems
@@ -1317,6 +1334,51 @@ extension ClientArchiveService: ClientContainerChangesProtocol {
         } catch {
             throw ClientArchiveError.operationFailed(message: "failed to compare the filesystem of \(container.id) with its image: \(error)")
         }
+    }
+
+    /// Apple Container keeps image snapshots at `snapshots/<manifest digest>/snapshot`, so the
+    /// snapshot a container was cloned from names the exact manifest its layers come from —
+    /// whatever its image reference points at now. The change layer is cut from a full
+    /// export of the rootfs, keeping only the paths `RootfsDiff` reports, with whiteouts for
+    /// deletions.
+    func exportChangeLayer(container: ContainerSnapshot) async throws -> CommitChangeLayer? {
+        let rootfsPath = getRootfsPath(containerId: container.id)
+        guard FileManager.default.fileExists(atPath: rootfsPath.path),
+            let snapshotPath = imageSnapshotPath(containerId: container.id),
+            let manifestDigest = Self.manifestDigest(ofSnapshot: snapshotPath)
+        else {
+            return nil
+        }
+        await flushIfRunning(container)
+
+        let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("commit-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let layerPath = FileManager.default.temporaryDirectory.appendingPathComponent("commit-layer-\(UUID().uuidString).tar")
+        let containerDevice = rootfsPath.path
+        do {
+            try await Task.detached(priority: .utility) {
+                let base = try EXT4.EXT4Reader(blockDevice: FilePath(snapshotPath.path))
+                let current = try EXT4.EXT4Reader(blockDevice: FilePath(containerDevice))
+                let changes = try RootfsDiff.changes(base: base, container: current)
+                let fullTar = scratch.appendingPathComponent("rootfs.tar")
+                if changes.contains(where: { $0.kind != .deleted }) {
+                    try current.export(archive: FilePath(fullTar.path))
+                }
+                try ImageLayerChanges.writeChangeLayer(changes: changes, fullRootfsTar: fullTar, to: layerPath)
+            }.value
+        } catch {
+            try? FileManager.default.removeItem(at: layerPath)
+            throw ClientArchiveError.operationFailed(message: "failed to build the change layer of \(container.id): \(error)")
+        }
+        return CommitChangeLayer(tarPath: layerPath, baseManifestDigest: manifestDigest)
+    }
+
+    /// `.../snapshots/<hex>/snapshot` → `sha256:<hex>`.
+    static func manifestDigest(ofSnapshot snapshotPath: URL) -> String? {
+        let hex = snapshotPath.deletingLastPathComponent().lastPathComponent
+        guard hex.count == 64, hex.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else { return nil }
+        return "sha256:\(hex)"
     }
 
     /// The image snapshot a container's rootfs was cloned from, as recorded in its
