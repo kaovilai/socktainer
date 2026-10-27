@@ -25,6 +25,17 @@ struct LibpodContainerWaitRoute: RouteCollection {
     /// Poll interval for state conditions; podman's own default.
     static let statePollIntervalNs: UInt64 = 250_000_000
 
+    /// podman's `interval` query: how often to check the condition, as a Go duration
+    /// ("250ms"). Anything unparsable is a 400, as in podman; an interval under a
+    /// millisecond is polled every millisecond rather than spinning.
+    static func pollInterval(from req: Request) throws -> UInt64 {
+        guard let raw = req.query[String.self, at: "interval"], !raw.isEmpty else { return statePollIntervalNs }
+        guard let seconds = GoDuration.seconds(raw) else {
+            throw Abort(.badRequest, reason: "invalid interval \"\(raw)\": time: invalid duration \"\(raw)\"")
+        }
+        return UInt64(max(seconds, 0.001) * 1_000_000_000)
+    }
+
     /// Every `condition` value (repeatable, and comma-separated for good measure); podman waits for
     /// the container to stop when none is given.
     static func conditions(from req: Request) throws -> [Condition] {
@@ -69,6 +80,7 @@ struct LibpodContainerWaitRoute: RouteCollection {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
             let conditions = try conditions(from: req)
+            let interval = try pollInterval(from: req)
             let container = try await ContainerWaitRoute.preflight(client: client, reference: reference)
             let nativeId = container.id
             if conditions.contains(where: { $0 == .state(.healthy) || $0 == .state(.unhealthy) }),
@@ -93,7 +105,7 @@ struct LibpodContainerWaitRoute: RouteCollection {
                     }
                 }
                 if !states.isEmpty {
-                    group.addTask { await stateReached(states, nativeId: nativeId, client: client, app: app) }
+                    group.addTask { await stateReached(states, nativeId: nativeId, client: client, app: app, intervalNs: interval) }
                 }
                 for await result in group {
                     if let result {
@@ -110,7 +122,8 @@ struct LibpodContainerWaitRoute: RouteCollection {
     /// Polls until the container is in one of `states` (-1), it is gone (-1, as podman reports a
     /// container that vanished), or the task is cancelled (nil).
     static func stateReached(
-        _ states: Set<State>, nativeId: String, client: ClientContainerProtocol, app: Application
+        _ states: Set<State>, nativeId: String, client: ClientContainerProtocol, app: Application,
+        intervalNs: UInt64 = statePollIntervalNs
     ) async -> Int64? {
         while !Task.isCancelled {
             do {
@@ -127,7 +140,7 @@ struct LibpodContainerWaitRoute: RouteCollection {
                 // A failed lookup is not a removal; poll again.
             }
             do {
-                try await Task.sleep(nanoseconds: statePollIntervalNs)
+                try await Task.sleep(nanoseconds: intervalNs)
             } catch {
                 return nil
             }
