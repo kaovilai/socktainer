@@ -96,6 +96,27 @@ struct ContainerInspectRouteNetworkSettingsTests {
         }
     }
 
+    @Test("inspect reports AutoRemove for a container created with --rm, so `docker start -a` waits for its removal")
+    func autoRemove() async throws {
+        let id = "c-rm-\(Int.random(in: 10000...99999))"
+        try await PreStartInjectionStore.shared.rememberCreateOptions(containerId: id, autoRemove: true)
+        defer { Task { try? await PreStartInjectionStore.shared.clear(containerId: id) } }
+        let removed = makeSnapshot(id: id, status: .stopped, configuredNetworks: [], liveNetworks: [])
+        try await withRoute(container: removed) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/\(id)/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.HostConfig.AutoRemove == true)
+            }
+        }
+        let kept = makeSnapshot(id: "c-keep", status: .stopped, configuredNetworks: [], liveNetworks: [])
+        try await withRoute(container: kept) { app in
+            try await app.testing().test(.GET, "/v1.51/containers/c-keep/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.HostConfig.AutoRemove != true)
+            }
+        }
+    }
+
     @Test("a container with no configured network reports Docker's default network mode")
     func defaultNetworkMode() async throws {
         let container = makeSnapshot(id: "c-nonet", status: .stopped, configuredNetworks: [], liveNetworks: [])
