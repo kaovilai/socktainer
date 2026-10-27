@@ -1,3 +1,4 @@
+import ContainerResource
 import Foundation
 import Vapor
 
@@ -36,14 +37,8 @@ struct ContainerWaitRoute: RouteCollection {
             // Preflight before flushing headers so a missing container returns a
             // real 404 instead of a streamed `200 {"StatusCode":0}` — the latter
             // would make "no such container" indistinguishable from a clean exit.
-            do {
-                guard try await client.getContainer(id: containerId) != nil else {
-                    throw Abort(.notFound, reason: "No such container: \(containerId)")
-                }
-            } catch ClientContainerError.ambiguousId(let reference, let matches) {
-                let matchList = matches.joined(separator: ", ")
-                throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
-            }
+            let container = try await preflight(client: client, reference: containerId)
+            let pending = await PendingWait.begin(condition: condition, nativeId: container.id, app: req.application)
 
             var headers = HTTPHeaders()
             headers.add(name: "Content-Type", value: "application/json")
@@ -53,47 +48,9 @@ struct ContainerWaitRoute: RouteCollection {
             let body = Response.Body(asyncStream: { writer in
                 _ = try? await writer.write(.buffer(sharedAllocator.buffer(capacity: 0)))
 
-                let result: RESTContainerWait
-                do {
-                    if condition == .healthy {
-                        var statusCode: Int64 = 0
-                        if let manager = req.application.storage[HealthCheckManagerKey.self] {
-                            while true {
-                                let health = await manager.currentHealth(for: containerId)
-                                if health?.Status == "healthy" { break }
-                                if health == nil {
-                                    statusCode = 1
-                                    break
-                                }
-                                guard let container = try? await client.getContainer(id: containerId),
-                                    container.status == .running
-                                else {
-                                    let code = await ContainerExitCodeStore.shared.get(id: containerId) ?? 1
-                                    statusCode = Int64(code)
-                                    break
-                                }
-                                try await Task.sleep(nanoseconds: ContainerWaitCondition.healthyPollIntervalNs)
-                            }
-                        } else {
-                            statusCode = 1
-                        }
-                        result = RESTContainerWait(statusCode: statusCode)
-                    } else if condition == .removed {
-                        result = try await client.wait(id: containerId, condition: condition)
-                    } else {
-                        // Subscribe before returning so a die event fired during the wait is
-                        // never missed by this listener.
-                        let events = await req.application.storage[EventBroadcasterKey.self]?.stream()
-                        result = await resolveNotRunning(
-                            containerId: containerId,
-                            client: client,
-                            condition: condition,
-                            events: events
-                        )
-                    }
-                } catch {
-                    result = RESTContainerWait(statusCode: 0)
-                }
+                let result = await waitResult(
+                    condition: condition, containerId: containerId, nativeId: container.id, client: client, app: req.application,
+                    pending: pending)
 
                 if let data = try? JSONEncoder().encode(result) {
                     var buf = sharedAllocator.buffer(capacity: data.count)
@@ -109,6 +66,87 @@ struct ContainerWaitRoute: RouteCollection {
 }
 
 extension ContainerWaitRoute {
+    /// The container `reference` names, or the Docker error for a missing or ambiguous one.
+    static func preflight(client: ClientContainerProtocol, reference: String) async throws -> ContainerSnapshot {
+        do {
+            guard let container = try await client.getContainer(id: reference) else {
+                throw Abort(.notFound, reason: "No such container: \(reference)")
+            }
+            return container
+        } catch ClientContainerError.ambiguousId(let reference, let matches) {
+            let matchList = matches.joined(separator: ", ")
+            throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
+        }
+    }
+
+    /// What a wait has to capture before the response head goes out (and so before a client can
+    /// start the container): the event subscription, and for `next-exit` the exit codes already
+    /// recorded, so one left by an earlier run is not mistaken for the next exit.
+    struct PendingWait: Sendable {
+        let events: AsyncStream<DockerEvent>?
+        let exitGeneration: Int?
+
+        static func begin(condition: ContainerWaitCondition, nativeId: String, app: Application) async -> PendingWait {
+            switch condition {
+            case .notRunning, .nextExit:
+                let generation = condition == .nextExit ? await ContainerExitCodeStore.shared.generation(id: nativeId) : nil
+                return PendingWait(events: await app.storage[EventBroadcasterKey.self]?.stream(), exitGeneration: generation)
+            case .removed, .healthy:
+                return PendingWait(events: nil, exitGeneration: nil)
+            }
+        }
+    }
+
+    /// Blocks until `condition` holds for the container and answers with its exit code.
+    static func waitResult(
+        condition: ContainerWaitCondition,
+        containerId: String,
+        nativeId: String,
+        client: ClientContainerProtocol,
+        app: Application,
+        pending: PendingWait
+    ) async -> RESTContainerWait {
+        do {
+            switch condition {
+            case .healthy:
+                var statusCode: Int64 = 0
+                if let manager = app.storage[HealthCheckManagerKey.self] {
+                    while true {
+                        let health = await manager.currentHealth(for: containerId)
+                        if health?.Status == "healthy" { break }
+                        if health == nil {
+                            statusCode = 1
+                            break
+                        }
+                        guard let container = try? await client.getContainer(id: containerId),
+                            container.status == .running
+                        else {
+                            let code = await ContainerExitCodeStore.shared.get(id: containerId) ?? 1
+                            statusCode = Int64(code)
+                            break
+                        }
+                        try await Task.sleep(nanoseconds: ContainerWaitCondition.healthyPollIntervalNs)
+                    }
+                } else {
+                    statusCode = 1
+                }
+                return RESTContainerWait(statusCode: statusCode)
+            case .removed:
+                return try await client.wait(id: containerId, condition: condition)
+            case .notRunning, .nextExit:
+                return await resolveNotRunning(
+                    containerId: containerId,
+                    client: client,
+                    condition: condition,
+                    events: pending.events,
+                    nextExitAfter: pending.exitGeneration.map { (nativeId, $0) }
+                )
+            }
+        } catch {
+            return RESTContainerWait(statusCode: 0)
+        }
+    }
+
     /// Poll interval shared by the exit-code and stopped-state watchers.
     static let waitPollIntervalNs: UInt64 = 100_000_000
     /// How long the stopped-state watcher gives the recorder to publish an exit code.
@@ -132,16 +170,27 @@ extension ContainerWaitRoute {
         client: ClientContainerProtocol,
         condition: ContainerWaitCondition = .notRunning,
         events: AsyncStream<DockerEvent>? = nil,
+        nextExitAfter: (nativeId: String, generation: Int)? = nil,
         storeTimeoutNs: UInt64 = 30_000_000_000
     ) async -> RESTContainerWait {
         await withTaskGroup(of: RESTContainerWait?.self) { group in
             group.addTask {
-                try? await client.wait(id: containerId, condition: condition)
+                // The native wait answers with whatever code is recorded, which for `next-exit`
+                // may be the previous run's; watch for a new one instead.
+                guard let nextExitAfter else { return try? await client.wait(id: containerId, condition: condition) }
+                return await nextRecordedExit(
+                    nativeId: nextExitAfter.nativeId, after: nextExitAfter.generation, client: client)
             }
             group.addTask {
                 let maxPolls = Int(storeTimeoutNs / waitPollIntervalNs)
                 for _ in 0..<maxPolls {
-                    if let code = await ContainerExitCodeStore.shared.get(id: containerId) {
+                    let recorded =
+                        if let nextExitAfter {
+                            await ContainerExitCodeStore.shared.get(id: nextExitAfter.nativeId, recordedAfter: nextExitAfter.generation)
+                        } else {
+                            await ContainerExitCodeStore.shared.get(id: containerId)
+                        }
+                    if let code = recorded {
                         return RESTContainerWait(statusCode: Int64(code))
                     }
                     // Cancellation must end this loop: swallowing it would keep polling for the
@@ -177,6 +226,23 @@ extension ContainerWaitRoute {
                     Message: "no exit observed for container \(containerId)"
                 )
             )
+        }
+    }
+
+    /// Waits for an exit code recorded after `generation`, or for the container to be removed.
+    private static func nextRecordedExit(nativeId: String, after generation: Int, client: ClientContainerProtocol) async -> RESTContainerWait? {
+        while true {
+            if let code = await ContainerExitCodeStore.shared.get(id: nativeId, recordedAfter: generation) {
+                return RESTContainerWait(statusCode: Int64(code))
+            }
+            do {
+                if try await client.getContainer(id: nativeId) == nil {
+                    return RESTContainerWait(statusCode: Int64(await ContainerExitCodeStore.shared.get(id: nativeId) ?? 0))
+                }
+            } catch {
+                // A failed lookup is not a removal; keep waiting.
+            }
+            guard await sleepUnlessCancelled(waitPollIntervalNs) else { return nil }
         }
     }
 
