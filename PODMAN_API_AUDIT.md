@@ -34,20 +34,32 @@ Limits that Docker-compat shares (libpod mirrors Docker-compat's support, it doe
   image must provide `ps` (busybox or procps); one without it (distroless, debian-slim) is a 500 that
   says so.
 - `pause`/`unpause` stop every process with SIGSTOP and resume it with SIGCONT (Apple Container has
-  no freezer or pause primitive). Paused state is kept in memory, so a daemon restart forgets it; an
-  image without a shell gets only PID 1 stopped.
-- `commit` writes the container's whole filesystem as one squashed layer on the base image's config
-  (Apple Container keeps no separate writable layer); the container is not paused while it is read,
-  its guest page cache is flushed first, as for `export`.
+  no freezer or pause primitive). Paused state is persisted (`socktainer-paused.json`) and survives a
+  daemon restart; entries for containers stopped or restarted while the daemon was down are dropped
+  at startup. An image without a shell gets only PID 1 stopped. `exec` into a paused container is a
+  409, as on Docker and podman.
+- `commit` writes the base image's layers plus one layer holding the container's changes (whiteouts
+  for deletions), like moby. It falls back to a single squashed layer for a never-started container
+  or when the base image's layers are no longer stored. The container is not paused while it is
+  read; its guest page cache is flushed first, as for `export`.
 - `diff` compares the container's `rootfs.ext4` with the image snapshot it was cloned from;
   `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` are hidden as Docker's init layer hides them.
-- `events --since`/`--until` replay an in-memory ring of recent events (last 1000 by default,
-  `SOCKTAINER_EVENTS_HISTORY`, 0 disables), which a daemon restart empties.
+- `events --since`/`--until` replay a ring of recent events (last 1000 by default,
+  `SOCKTAINER_EVENTS_HISTORY`, 0 disables), persisted to `socktainer-events.jsonl` (capped at twice
+  the history limit), so it survives a daemon restart.
 - `save` without `--platform` exports only the platforms whose content is in the local store.
 - `manifest annotate` sets architecture, OS, variant and annotations (instance and `--index`);
   `--os-version`, `--os-features` and `--features` are a 400, since the image store cannot encode them.
-- A named volume cannot be mounted by two running containers at once (Apple Virtualization rejects a
-  second attachment of the same block device: "The storage device attachment is invalid").
+- A default named volume is an ext4 disk image, which only one running container can safely mount:
+  starting a second container that mounts it while another running container has it is a 409
+  (`volume "X" is in use by running container Y; ext4-backed volumes can't be shared`). Compose
+  files that mount one default volume in two services now get that error instead of two diverging
+  copies. To share, create the volume with local-driver bind options
+  (`--opt type=none --opt o=bind --opt device=/host/dir`, also Compose `driver_opts`): it is the host
+  directory over virtiofs, any number of running containers can mount it, it is reported as a
+  volume and cannot be removed while in use. Unlike a default volume it gets no copy-up of image
+  content. Directory-backed default volumes are not viable: virtiofs ignores `chown` and rejects
+  `chmod` on the share root.
 - `podman cp` out of a container to a host path under `/tmp` fails inside the podman client on macOS
   (`/tmp` is a symlink to `/private/tmp`); copying to a real directory works.
 
@@ -77,18 +89,18 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 | `podman logs` | GET `/libpod/containers/{id}/logs` | ✅ |
 | `podman top` | GET `/libpod/containers/{id}/top` | ✅ (psgo descriptors mapped onto `ps -o`; `%CPU` computed as psgo does; plain `ps` arguments passed through) |
 | `podman rename` | POST `/libpod/containers/{id}/rename` | ✅ (any container that is not running, as Docker-compat) |
-| `podman wait` | POST `/libpod/containers/{id}/wait` | ✅ (several `condition`s are ORed; `stopped`/`exited`/`removing`, plus `running`, `created`/`configured`, `paused`, `healthy`/`unhealthy` answering -1 as podman does; `interval` honoured; `stopping`/`unknown` are 501) |
+| `podman wait` | POST `/libpod/containers/{id}/wait` | ✅ (several `condition`s are ORed; `stopped`/`exited`/`removing`, plus `running`, `created`/`configured`, `paused`, `healthy`/`unhealthy`, `stopping`, `unknown` answering -1 as podman does; a container seen running and then found stopped counts as `stopping`; `interval` honoured) |
 | `podman attach` | POST `/libpod/containers/{id}/attach` | ✅ (stdin reaches a running container started with `-i`; detach keys honoured, default ctrl-p,ctrl-q) |
-| `podman exec` (create+start) | POST `/libpod/containers/{id}/exec`, `/libpod/exec/{id}/start`, GET `/libpod/exec/{id}/json`, POST `/libpod/exec/{id}/remove` | ✅ (`exec -t` keeps the session's terminal setting, like podman, whatever the start body says) |
+| `podman exec` (create+start) | POST `/libpod/containers/{id}/exec`, `/libpod/exec/{id}/start`, GET `/libpod/exec/{id}/json`, POST `/libpod/exec/{id}/remove` | ✅ (`exec -t` keeps the session's terminal setting, like podman, whatever the start body says; a paused container is a 409, `container state improper`) |
 | terminal resize (`run -it`, `attach`, `exec -it`) | POST `/libpod/containers/{id}/resize`, `/libpod/exec/{id}/resize` | ✅ (a resize before start is applied once the process starts) |
 | `podman stats` | GET `/libpod/containers/stats` (batch, what the CLI calls) and `/libpod/containers/{name}/stats` | ✅ |
-| `podman pause` | POST `/libpod/containers/{name}/pause` | ✅ (SIGSTOP to every process; inspect/ps report paused) |
+| `podman pause` | POST `/libpod/containers/{name}/pause` | ✅ (SIGSTOP to every process; inspect/ps report paused; survives daemon restart) |
 | `podman unpause` | POST `/libpod/containers/{name}/unpause` | ✅ |
 | `podman container prune` | POST `/libpod/containers/prune` | ✅ |
 | `podman update` | POST `/libpod/containers/{name}/update` | ✅ |
-| `podman commit` | POST `/libpod/commit` | ✅ (single squashed layer; `changes`, including the `CMD=` shorthand; streamed or not) |
+| `podman commit` | POST `/libpod/commit` | ✅ (base layers + one change layer; `changes`, including the `CMD=` shorthand; streamed or not) |
 | `podman export` | GET `/libpod/containers/{name}/export` | ✅ (a running container's guest is flushed first) |
-| `podman diff` (container) | GET `/libpod/containers/{name}/changes` | ✅ (moby `ChangesDirs` semantics) |
+| `podman diff` (container) | GET `/libpod/containers/{name}/changes` | ✅ (moby `ChangesDirs` semantics; `diffType=all\|container\|image` honoured, `all` falls back to the image for an image name, a bad value is 400) |
 | `podman healthcheck run` | GET `/libpod/containers/{name}/healthcheck` (libpod-only) | ✅ (one run of the configured check through the scheduled probe; updates `State.Health`; 409 without a healthcheck or when not running) |
 | `podman cp` | GET/HEAD/PUT `/libpod/containers/{name}/archive` | ✅ |
 
@@ -109,7 +121,7 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 | `podman save` | GET `/libpod/images/{name}/get` (single) or `/libpod/images/export?references=...` (multi) | ✅ (platforms whose content is local) |
 | `podman load` | POST `/libpod/local/images/load` (confirmed in podman source — note: NOT `/libpod/images/load`) | ✅ |
 | `podman untag` | POST `/libpod/images/{name}/untag` | ✅ |
-| `podman image diff` | GET `/libpod/images/{name}/changes` | ❌ 501: Apple Container unpacks one filesystem per image, with no parent snapshot to compare against |
+| `podman image diff` | GET `/libpod/images/{name}/changes`; the CLI calls `/libpod/containers/{name}/changes?difftype=image` | ✅ (top layer against the layers below it: whiteout = D, path present below = C, else A; with `parent`, both images' full filesystems are compared) |
 | `podman import` | POST `/libpod/images/import` (confirmed in podman source: query params are `reference`/`message`/`changes`/`url`, not Docker's `repo`/`tag`/`fromSrc`) | ✅ (translates libpod's `reference` query param into Docker's `repo`/`tag`/`fromSrc=-` shape, then delegates; `url`-based remote import still rejected, same limitation as the Docker-side route) |
 
 ## Volumes
@@ -211,7 +223,11 @@ containers instead.
 | `podman pod start` / `stop` / `restart` / `kill` | POST `/libpod/pods/{name}/start|stop|restart|kill` | ✅ |
 | `podman pod rm` / `prune` | DELETE `/libpod/pods/{name}`, POST `/libpod/pods/prune` | ✅ |
 | `podman run --pod`, `podman ps --pod` | container create joins the pod; list/inspect report `Pod`/`PodName` | ✅ |
-| `podman pod top` / `stats` / `pause` / `unpause` / `clone` / `logs` | | ❌ 404 |
+| `podman pod top` | GET `/libpod/pods/{name}/top` | ✅ (PIDs are each member's own; only format descriptors are accepted, `-ef` is "unknown descriptor" as on podman) |
+| `podman pod stats` | GET `/libpod/pods/stats` (`-a`, `--format json`, no names) | ✅ |
+| `podman pod pause` / `unpause` | POST `/libpod/pods/{name}/pause|unpause` | ✅ |
+| `podman pod logs -c <member>` | container logs endpoint | ✅ (the remote client requires `-c`) |
+| `podman pod clone` | | ➖ the remote client never sends a request (pkg/domain/infra/tunnel/pods.go returns nil) |
 
 podman-compose 1.6.0 in-pod `up -d`/`ps`/`down` works.
 
@@ -237,15 +253,11 @@ podman-compose 1.6.0 in-pod `up -d`/`ps`/`down` works.
   `/libpod/networks/{name}/exists` all return 204 (exists) or 404 (not found).
 - `podman generate systemd` — out of scope (systemd unit generation is a
   Linux-host concept, not meaningful under Apple Container).
-- `podman wait --condition stopping|unknown` — 501; this daemon has no
-  distinct stopping state to wait for.
 
 ## Top gaps worth implementing next (priority order)
 
-1. **`podman image diff`** (`/libpod/images/{name}/changes`) — would need the
-   top layer's tar walked against the layers below it, since the store keeps
-   no per-layer snapshot.
-2. Pod `top`/`stats`/`pause`/`unpause`/`logs`/`clone` — fan-outs over the
-   per-container routes that already exist.
-3. Shared named volumes between running containers — blocked on Apple
-   Virtualization's one-attachment-per-block-device rule.
+1. Sharing a *default* (ext4) named volume between running containers — blocked
+   on Apple Container mounting each volume as a disk image per VM; refused with
+   a 409 today, shareable only via bind-option volumes.
+2. `podman pod clone` — needs client-side support in podman's remote tunnel
+   before the server can do anything.
