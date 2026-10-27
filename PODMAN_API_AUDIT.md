@@ -23,12 +23,8 @@ about 230 `podman` commands (including attached `podman run`/`start -a`) across 
 exec, logs, stats, cp, filters, formats, error mapping, ~40 `run` flags), `build` (single and
 multi-platform, Rosetta and QEMU builders), push to a local registry, and manifest lists.
 
-Limits that Docker-compat shares (libpod mirrors Docker-compat's support, it does not go beyond it):
+Limits that Docker-compat shares (libpod mirrors Docker-compat's support, it does not go beyond it). `events --filter` is still ignored, and `events --since` has no history to replay (it only drops older events):
 
-- `podman events --since/--until`: Docker-compat's events route ignores both, so `--until` never ends.
-- `podman build -q` hangs (the Docker-compat `?q=1` build hangs the same way).
-- A never-started container reports `exited` (not `created`), so `ps --filter status=created` is empty.
-- `network rm` of a missing network answers 500 instead of 404.
 - `podman logs --since/--until`: Docker-compat's logs route ignores both.
 - `podman stop`/`restart` without `--time` waits 5 seconds (podman and Docker default to 10).
 - Container inspect `Image` carries the image reference, not the image ID.
