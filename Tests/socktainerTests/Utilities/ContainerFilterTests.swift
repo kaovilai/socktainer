@@ -100,6 +100,18 @@ struct ContainerFilterTests {
         #expect(result.map(\.id) == ["a"])
     }
 
+    @Test("a stopped container that never started is `created`, not `exited`")
+    func statusCreatedVersusExited() throws {
+        let containers = [
+            try makeSnapshot(id: "a", status: .running),
+            try makeSnapshot(id: "b", status: .stopped),
+            try makeSnapshot(id: "c", status: .stopped, neverStarted: true),
+        ]
+        #expect(ClientContainerService.applyFilters(containers, filters: ["status": ["created"]]).map(\.id) == ["c"])
+        #expect(ClientContainerService.applyFilters(containers, filters: ["status": ["exited"]]).map(\.id) == ["b"])
+        #expect(ClientContainerService.applyFilters(containers, filters: ["exited": ["0"]]).map(\.id) == ["b"])
+    }
+
     @Test("status=exited keeps only stopped containers")
     func statusExited() throws {
         let containers = [
@@ -343,7 +355,8 @@ private func makeSnapshot(
     status: RuntimeStatus = .running,
     labels: [String: String] = [:],
     image: String = "alpine:latest",
-    networkNames: [String] = []
+    networkNames: [String] = [],
+    neverStarted: Bool = false
 ) throws -> ContainerSnapshot {
     let proc = ProcessConfiguration(
         executable: "/bin/sh", arguments: [], environment: [],
@@ -356,7 +369,8 @@ private func makeSnapshot(
     var config = ContainerConfiguration(id: id, image: img, process: proc)
     config.labels = labels
     let attachments = try networkNames.map { try makeAttachment(network: $0) }
-    return ContainerSnapshot(configuration: config, status: status, networks: attachments)
+    // A container that has run has a start date; only a never-started one lacks it (Docker's `created`).
+    return ContainerSnapshot(configuration: config, status: status, networks: attachments, startedDate: neverStarted ? nil : Date(timeIntervalSinceNow: -60))
 }
 
 private func makeAttachment(network: String) throws -> ContainerResource.Attachment {

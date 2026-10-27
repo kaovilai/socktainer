@@ -192,17 +192,17 @@ extension ContainerInspectRoute {
             let isPendingRestart = await ContainerRestartState.shared.isPendingRestart(id: container.id)
 
             let containerState: ContainerState = ContainerState(
-                Status: isPendingRestart ? "restarting" : container.status.mobyState,
+                Status: isPendingRestart ? "restarting" : container.mobyState,
                 Running: container.status == .running,
                 Paused: false,  // Apple containers don't have a paused state like Docker
                 Restarting: isPendingRestart,
                 OOMKilled: false,
-                Dead: container.status == .stopped && !isPendingRestart,
+                Dead: container.status == .stopped && !isPendingRestart && !container.isNeverStarted,
                 Pid: 0,  // we have no mechanism to derive PID in Apple container
                 ExitCode: container.status == .stopped ? 0 : 0,
                 Error: "",
                 StartedAt: container.startedDate.map { AppleContainerTimestampResolver.iso8601Timestamp($0) } ?? "",
-                FinishedAt: container.status == .stopped ? "1970-01-01T00:00:00.000000000Z" : "",
+                FinishedAt: container.isNeverStarted ? "0001-01-01T00:00:00Z" : (container.status == .stopped ? "1970-01-01T00:00:00.000000000Z" : ""),
                 Health: health
             )
 

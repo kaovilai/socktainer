@@ -261,7 +261,8 @@ struct ContainerInspectRouteRestartPolicyTests {
         if let restartPolicyLabel {
             containerConfig.labels = [RestartPolicyManager.label: restartPolicyLabel]
         }
-        return ContainerSnapshot(configuration: containerConfig, status: .stopped, networks: [])
+        // Exited, not `created`: a container that has run has a start date.
+        return ContainerSnapshot(configuration: containerConfig, status: .stopped, networks: [], startedDate: Date(timeIntervalSinceNow: -60))
     }
 
     private func encodedPolicy(name: String, maximumRetryCount: Int? = nil) -> String {
@@ -358,6 +359,32 @@ struct ContainerInspectRouteRestartPolicyTests {
         }
 
         await ContainerRestartState.shared.reset(id: nativeId)
+    }
+
+    @Test("a stopped container that never started inspects as created, not exited")
+    func neverStartedIsCreated() async throws {
+        let nativeId = "never-started-inspect"
+        let proc = ProcessConfiguration(
+            executable: "/bin/sh", arguments: [], environment: [], workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0))
+        let img = ImageDescription(
+            reference: "alpine:latest", descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0))
+        let snapshot = ContainerSnapshot(
+            configuration: ContainerConfiguration(id: nativeId, image: img, process: proc), status: .stopped, networks: [])
+        let mock = InspectMock(snapshot: snapshot)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: mock))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(nativeId)/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.State.Status == "created")
+                #expect(inspect.State.Running == false)
+                #expect(inspect.State.Dead == false)
+            }
+        }
     }
 
     @Test("State.Restarting is false and Status is unaffected when no restart is pending")
