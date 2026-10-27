@@ -18,7 +18,34 @@ extension EventsRoute {
         return ISO8601DateFormatter().date(from: value)
     }
 
-    static func handler(client: ClientHealthCheckProtocol) -> @Sendable (Request) async throws -> Response {
+    /// Parsed `GET /events` (or `/libpod/events`) query.
+    struct Query: Sendable {
+        let flavor: EventFilter.Flavor
+        let filter: EventFilter
+
+        /// Translates (libpod) and filters an event; nil when it must not be sent.
+        func render(_ event: DockerEvent) -> DockerEvent? {
+            let shaped: DockerEvent?
+            switch flavor {
+            case .docker: shaped = event
+            case .libpod: shaped = LibpodEventTranslation.translate(event)
+            }
+            guard let shaped, filter.matches(shaped) else { return nil }
+            return shaped
+        }
+    }
+
+    static func parseQuery(_ req: Request, flavor: EventFilter.Flavor) throws -> Query {
+        let filter: EventFilter
+        do {
+            filter = try EventFilter.parse(req.query[String.self, at: "filters"], flavor: flavor)
+        } catch {
+            throw Abort(.badRequest, reason: "\(error)")
+        }
+        return Query(flavor: flavor, filter: filter)
+    }
+
+    static func handler(client: ClientHealthCheckProtocol, flavor: EventFilter.Flavor = .docker) -> @Sendable (Request) async throws -> Response {
         { req in
 
             guard let broadcaster = req.application.storage[EventBroadcasterKey.self] else {
@@ -26,6 +53,7 @@ extension EventsRoute {
             }
             // There is no event history to replay, so `since` only drops events older than it, and
             // `until` ends the stream at that time (immediately when it has already passed).
+            let query = try parseQuery(req, flavor: flavor)
             let since = parseTimestamp(req.query["since"] as String?)
             let until = parseTimestamp(req.query["until"] as String?)
             let stream = await broadcaster.stream()
@@ -62,7 +90,8 @@ extension EventsRoute {
                     group.addTask {
                         for await event in stream {
                             if let since, Double(event.time) < since.timeIntervalSince1970.rounded(.down) { continue }
-                            if let json = try? JSONEncoder().encode(event) {
+                            guard let rendered = query.render(event) else { continue }
+                            if let json = try? JSONEncoder().encode(rendered) {
                                 var buffer = req.application.allocator.buffer(capacity: json.count + 1)
                                 buffer.writeBytes(json)
                                 buffer.writeString("\n")

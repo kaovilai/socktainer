@@ -20,6 +20,9 @@ struct DockerEvent: Codable {
     let scope: String
     let time: Int
     let timeNano: UInt64
+    /// Podman's `entities.Event.HealthStatus`; only set on translated libpod
+    /// `health_status` events and omitted from the JSON otherwise.
+    var HealthStatus: String? = nil
 }
 
 extension DockerEvent {
