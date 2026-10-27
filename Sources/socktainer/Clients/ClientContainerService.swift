@@ -164,10 +164,10 @@ struct ClientContainerService: ClientContainerProtocol {
         for (key, values) in filters {
             switch key {
             case "status":
-                result = result.filter { values.contains($0.status.mobyState) }
+                result = result.filter { values.contains($0.mobyState) }
             case "exited":
                 result = result.filter { container in
-                    guard container.status == .stopped else { return false }
+                    guard container.status == .stopped, !container.isNeverStarted else { return false }
                     return values.contains("0") || values.isEmpty
                 }
             case "label":
