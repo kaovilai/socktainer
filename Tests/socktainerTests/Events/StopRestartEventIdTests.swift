@@ -100,6 +100,50 @@ struct StopRestartEventIdTests {
         #expect(event?.Actor.Attributes["name"] == "sockt-evtid-native")
     }
 
+    @Test("restarting a running container logs moby's kill, die, stop, start, restart in order")
+    func restartEventSequence() async throws {
+        let snapshot = Self.snapshot(nativeId: "po-restart-seq")
+        let broadcaster = EventBroadcaster()
+        let stream = await broadcaster.stream()
+        let captureTask = Task<[DockerEvent], Never> {
+            var seen: [DockerEvent] = []
+            for await event in stream {
+                seen.append(event)
+                if event.Action == "restart" { break }
+            }
+            return seen
+        }
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            app.storage[EventBroadcasterKey.self] = broadcaster
+            try app.register(collection: ContainerRestartRoute(client: FixedSnapshotMock(snapshot: snapshot)))
+
+            try await app.testing().test(.POST, "/v1.51/containers/po-restart-seq/restart?signal=SIGINT") { res async in
+                #expect(res.status == .noContent)
+            }
+        }
+
+        let events = await captureTask.value
+        #expect(events.map(\.Action) == ["kill", "die", "stop", "start", "restart"])
+        #expect(events.first?.Actor.Attributes["signal"] == "2")
+        #expect(Set(events.map(\.Actor.ID)) == [DockerContainerID.hexId(for: snapshot)])
+    }
+
+    @Test("restart completion events: die carries a known exit code; a stopped container only starts")
+    func restartCompletionEvents() {
+        let snapshot = Self.snapshot(nativeId: "po-restart-done")
+        let running = ContainerRestartRoute.completionEvents(id: "po", snapshot: snapshot, wasRunning: true, exitCode: 143)
+        #expect(running.map(\.Action) == ["die", "stop", "start", "restart"])
+        #expect(running[0].Actor.Attributes["exitCode"] == "143")
+        let unknown = ContainerRestartRoute.completionEvents(id: "po", snapshot: snapshot, wasRunning: true, exitCode: nil)
+        #expect(unknown[0].Actor.Attributes["exitCode"] == nil)
+        let stopped = ContainerRestartRoute.completionEvents(id: "po", snapshot: snapshot, wasRunning: false, exitCode: nil)
+        #expect(stopped.map(\.Action) == ["start", "restart"])
+    }
+
     // MARK: - Helpers
 
     private static func snapshot(nativeId: String) -> ContainerSnapshot {
