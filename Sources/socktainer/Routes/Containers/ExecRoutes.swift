@@ -328,6 +328,9 @@ struct ExecRoute: RouteCollection {
                 let Detach: Bool?
                 let Tty: Bool?
                 let ConsoleSize: [Int]?
+                // podman sends the initial size as `h`/`w` instead of `ConsoleSize`.
+                let h: Int?
+                let w: Int?
             }
 
             let startRequest = try req.content.decode(StartExecRequest.self)
@@ -361,7 +364,8 @@ struct ExecRoute: RouteCollection {
             // Apply it as the initial PTY winsize right after start so `stty size` and TUIs
             // (vim/htop/less) work, rather than relying solely on the async /exec/{id}/resize
             // call, which can race the process registration and be dropped.
-            let initialTerminalSize = ExecRoute.initialTerminalSize(tty: tty, consoleSize: startRequest.ConsoleSize)
+            let initialTerminalSize = ExecRoute.initialTerminalSize(
+                tty: tty, consoleSize: ExecRoute.requestedConsoleSize(startRequest.ConsoleSize, h: startRequest.h, w: startRequest.w))
 
             // Detached mode
             if detach {
@@ -884,6 +888,14 @@ struct ExecRoute: RouteCollection {
             width: UInt16(min(cs[1], Int(UInt16.max))),
             height: UInt16(min(cs[0], Int(UInt16.max)))
         )
+    }
+
+    /// The initial `[height, width]` an exec start asks for: Docker's `ConsoleSize`, else
+    /// podman's `h`/`w`.
+    static func requestedConsoleSize(_ consoleSize: [Int]?, h: Int?, w: Int?) -> [Int]? {
+        if let consoleSize { return consoleSize }
+        guard let h, let w else { return nil }
+        return [h, w]
     }
 
     static let resizeExec: @Sendable (Request) async throws -> Response = { req in
