@@ -24,6 +24,51 @@ struct ContainerChangesRouteTests {
         }
     }
 
+    @Test(
+        "podman image diff reaches the libpod container endpoint with difftype=image and is answered from the image",
+        arguments: [
+            "/v1.51/libpod/containers/alpine:latest/changes?difftype=image",
+            "/v1.51/libpod/containers/alpine:latest/changes?diffType=image",
+            // The default `all` falls back to an image when no container has the name.
+            "/v1.51/libpod/containers/alpine:latest/changes",
+        ])
+    func imageDiffThroughContainerEndpoint(path: String) async throws {
+        let recorder = ImageChangesRecorder()
+        try await withChangesApp(client: NoSuchContainerClient(), changes: FixedChangesClient(result: .success([])), imageChanges: recorder.lookup) { app in
+            try await app.testing().test(.GET, path) { res async throws in
+                #expect(res.status == .ok)
+                let body = try JSONDecoder().decode([RESTContainerChange].self, from: Data(buffer: res.body))
+                #expect(body == [RESTContainerChange(Path: "/etc", Kind: 0)])
+            }
+        }
+        #expect(await recorder.names() == ["alpine:latest"])
+    }
+
+    @Test("podman image diff A B passes B as the parent")
+    func imageDiffWithParent() async throws {
+        let recorder = ImageChangesRecorder()
+        try await withChangesApp(client: NoSuchContainerClient(), changes: FixedChangesClient(result: .success([])), imageChanges: recorder.lookup) { app in
+            try await app.testing().test(.GET, "/v1.51/libpod/containers/a:1/changes?difftype=image&parent=b%3A2") { res async in
+                #expect(res.status == .ok)
+            }
+        }
+        #expect(await recorder.parents() == ["b:2"])
+    }
+
+    @Test("diffType=container never falls back to an image, and an unknown diffType is a 400")
+    func containerOnlyAndInvalidDiffType() async throws {
+        let recorder = ImageChangesRecorder()
+        try await withChangesApp(client: NoSuchContainerClient(), changes: FixedChangesClient(result: .success([])), imageChanges: recorder.lookup) { app in
+            try await app.testing().test(.GET, "/v1.51/libpod/containers/alpine/changes?diffType=container") { res async in
+                #expect(res.status == .notFound)
+            }
+            try await app.testing().test(.GET, "/v1.51/libpod/containers/alpine/changes?diffType=layers") { res async in
+                #expect(res.status == .badRequest)
+            }
+        }
+        #expect(await recorder.names().isEmpty)
+    }
+
     @Test("an unknown container is a 404")
     func unknownContainer() async throws {
         try await withChangesApp(client: NoSuchContainerClient(), changes: FixedChangesClient(result: .success([]))) { app in
@@ -49,6 +94,7 @@ struct ContainerChangesRouteTests {
 private func withChangesApp(
     client: ClientContainerProtocol,
     changes: FixedChangesClient,
+    imageChanges: LibpodContainerChangesRoute.ImageChanges? = nil,
     test: @escaping (Application) async throws -> Void
 ) async throws {
     try await withApp(configure: { _ in }) { app in
@@ -56,8 +102,26 @@ private func withChangesApp(
         app.setRegexRouter(regexRouter)
         regexRouter.installMiddleware(on: app)
         try app.register(collection: ContainerChangesRoute(containerClient: client, changesClient: changes))
-        try app.register(collection: LibpodContainerChangesRoute(containerClient: client, changesClient: changes))
+        var libpod = LibpodContainerChangesRoute(containerClient: client, changesClient: changes)
+        if let imageChanges { libpod.imageChanges = imageChanges }
+        try app.register(collection: libpod)
         try await test(app)
+    }
+}
+
+private actor ImageChangesRecorder {
+    private var calls: [(name: String, parent: String?)] = []
+
+    func names() -> [String] { calls.map(\.name) }
+    func parents() -> [String?] { calls.map(\.parent) }
+
+    private func record(_ name: String, _ parent: String?) { calls.append((name, parent)) }
+
+    nonisolated var lookup: LibpodContainerChangesRoute.ImageChanges {
+        { name, parent, _ in
+            await self.record(name, parent)
+            return [RESTContainerChange(Path: "/etc", Kind: 0)]
+        }
     }
 }
 
