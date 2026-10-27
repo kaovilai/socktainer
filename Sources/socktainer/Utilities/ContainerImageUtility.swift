@@ -691,6 +691,140 @@ enum ContainerImageUtility {
     }
 }
 
+/// The image a container was created from, which `docker commit` stacks its layer on.
+struct CommitBase: Sendable {
+    /// `sha256:`-prefixed digest of the platform manifest.
+    let manifestDigest: String
+    let manifest: Data
+    let config: Data
+    /// The content store holding the manifest's layer blobs (as `blobs/sha256/<hex>`).
+    let contentRoot: URL
+
+    /// The manifest's layer descriptors, verbatim.
+    func layers() throws -> [[String: Any]] {
+        guard let object = try JSONSerialization.jsonObject(with: manifest) as? [String: Any] else {
+            throw ContainerImageUtility.Error.invalidTarball(reason: "base manifest \(manifestDigest) is not a JSON object")
+        }
+        return object["layers"] as? [[String: Any]] ?? []
+    }
+}
+
+extension ContainerImageUtility {
+    static let dockerManifestMediaType = "application/vnd.docker.distribution.manifest.v2+json"
+
+    /// `docker commit` of a container whose image layers are still in the store: the base
+    /// image's layers, unchanged and shared, plus one layer holding the container's changes
+    /// (`changeTarPath`, an uncompressed tar from `ImageLayerChanges.writeChangeLayer`).
+    ///
+    /// The config is the base image's with `configDict` as its `config`, the new layer's
+    /// diff_id appended to `rootfs.diff_ids` and a history entry for it. The manifest keeps
+    /// the base manifest's media-type family (OCI or Docker schema 2).
+    ///
+    /// Returns the manifest digest (without the `sha256:` prefix).
+    static func buildLayeredOCILayout(
+        changeTarPath: URL,
+        base: CommitBase,
+        ociLayoutPath: URL,
+        configDict: [String: Any],
+        message: String?,
+        author: String?,
+        reference: String?,
+        logger: Logger
+    ) throws -> String {
+        let blobsDir = ociLayoutPath.appendingPathComponent("blobs/sha256")
+        try FileManager.default.createDirectory(at: blobsDir, withIntermediateDirectories: true)
+        try "{\"imageLayoutVersion\": \"1.0.0\"}".write(
+            to: ociLayoutPath.appendingPathComponent("oci-layout"), atomically: true, encoding: .utf8)
+
+        guard let baseManifest = try JSONSerialization.jsonObject(with: base.manifest) as? [String: Any],
+            var imageConfig = try JSONSerialization.jsonObject(with: base.config) as? [String: Any]
+        else {
+            throw Error.invalidTarball(reason: "base image \(base.manifestDigest) has an unreadable manifest or config")
+        }
+        let baseLayers = try base.layers()
+        for layer in baseLayers {
+            guard let digest = layer["digest"] as? String, digest.hasPrefix("sha256:") else {
+                throw Error.invalidTarball(reason: "base image \(base.manifestDigest) has a layer without a sha256 digest")
+            }
+            let hex = String(digest.dropFirst("sha256:".count))
+            let source = base.contentRoot.appendingPathComponent("blobs/sha256").appendingPathComponent(hex)
+            let destination = blobsDir.appendingPathComponent(hex)
+            guard !FileManager.default.fileExists(atPath: destination.path) else { continue }
+            // Hard-link rather than copy: the store already holds these bytes.
+            do {
+                try FileManager.default.linkItem(at: source, to: destination)
+            } catch {
+                try FileManager.default.copyItem(at: source, to: destination)
+            }
+        }
+
+        let layer = try gzipCompressAndStore(plainTarPath: changeTarPath, into: blobsDir)
+        let docker = (baseManifest["mediaType"] as? String) == dockerManifestMediaType
+
+        let createdAt = ISO8601DateFormatter().string(from: Date())
+        var rootfs = imageConfig["rootfs"] as? [String: Any] ?? ["type": "layers"]
+        rootfs["diff_ids"] = (rootfs["diff_ids"] as? [String] ?? []) + ["sha256:\(layer.diffID)"]
+        var historyEntry: [String: Any] = ["created": createdAt, "comment": message ?? ""]
+        if let author, !author.isEmpty {
+            historyEntry["author"] = author
+            imageConfig["author"] = author
+        } else {
+            imageConfig["author"] = nil
+        }
+        imageConfig["rootfs"] = rootfs
+        imageConfig["history"] = (imageConfig["history"] as? [[String: Any]] ?? []) + [historyEntry]
+        imageConfig["config"] = configDict
+        imageConfig["created"] = createdAt
+        // Fields describing the base's own build container say nothing about this commit.
+        imageConfig["container"] = nil
+        imageConfig["container_config"] = nil
+
+        let configData = try JSONSerialization.data(withJSONObject: imageConfig, options: [])
+        let configDigest = configData.sha256Hex()
+        try configData.write(to: blobsDir.appendingPathComponent(configDigest))
+
+        let manifestMediaType = docker ? dockerManifestMediaType : "application/vnd.oci.image.manifest.v1+json"
+        let manifest: [String: Any] = [
+            "schemaVersion": 2,
+            "mediaType": manifestMediaType,
+            "config": [
+                "mediaType": docker ? "application/vnd.docker.container.image.v1+json" : "application/vnd.oci.image.config.v1+json",
+                "digest": "sha256:\(configDigest)",
+                "size": configData.count,
+            ],
+            "layers": baseLayers + [
+                [
+                    "mediaType": docker ? "application/vnd.docker.image.rootfs.diff.tar.gzip" : layer.mediaType,
+                    "digest": "sha256:\(layer.digest)",
+                    "size": layer.size,
+                ]
+            ],
+        ]
+        let manifestData = try JSONSerialization.data(withJSONObject: manifest, options: [])
+        let manifestDigest = manifestData.sha256Hex()
+        try manifestData.write(to: blobsDir.appendingPathComponent(manifestDigest))
+
+        var manifestDescriptor: [String: Any] = [
+            "mediaType": manifestMediaType,
+            "digest": "sha256:\(manifestDigest)",
+            "size": manifestData.count,
+        ]
+        if let reference {
+            manifestDescriptor["annotations"] = ["org.opencontainers.image.ref.name": reference]
+        }
+        let index: [String: Any] = [
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [manifestDescriptor],
+        ]
+        try JSONSerialization.data(withJSONObject: index, options: [.prettyPrinted])
+            .write(to: ociLayoutPath.appendingPathComponent("index.json"))
+
+        logger.info("Committed sha256:\(manifestDigest): \(baseLayers.count) base layer(s) plus one change layer")
+        return manifestDigest
+    }
+}
+
 extension Data {
     func sha256Hex() -> String {
         let hash = SHA256.hash(data: self)
