@@ -45,7 +45,10 @@ struct LibpodContainersStatsRoute: RouteCollection {
                             guard let body = await LibpodAdapter.jsonBody(of: response, on: req) as? [String: Any] else {
                                 throw Abort(.internalServerError, reason: "no stats for \(reference): is the container running?")
                             }
-                            let stats = LibpodSchema.containerStats(body, containerID: body["id"] as? String ?? reference)
+                            // podman's AvgCPU averages over the time since the container started.
+                            let startedAt = try? await client.getContainer(id: reference)?.startedDate
+                            let stats = LibpodSchema.containerStats(
+                                body, containerID: body["id"] as? String ?? reference, startedAt: startedAt)
                             return (index, try JSONSerialization.data(withJSONObject: stats))
                         }
                     }
