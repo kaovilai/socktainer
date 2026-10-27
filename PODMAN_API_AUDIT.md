@@ -27,6 +27,8 @@ Limits that Docker-compat shares (libpod mirrors Docker-compat's support, it doe
 
 - `top`, `commit`, `diff`, `pause`/`unpause` and `manifest annotate` are not implemented (Docker-compat
   has no implementation either); `rename` only works before the first start.
+- Inspect reports `Config.Entrypoint`/`Config.Cmd` as the process's executable and arguments (`sleep` / `[300]`) rather
+  than the original create request (`null` / `[sleep 300]`), since only the resulting process is stored.
 - `podman save` fails with "ContentStore missing blob data", an Apple Container image-store limitation.
 - `podman cp` out of a container to a host path under `/tmp` fails inside the podman client on macOS
   (`/tmp` is a symlink to `/private/tmp`); copying to a real directory works.
