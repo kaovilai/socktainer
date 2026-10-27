@@ -38,6 +38,7 @@ func configure(_ app: Application) async throws {
     let containerClient = ClientContainerService()
     await RestartPolicyOverrideStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
     await PreStartInjectionStore.shared.configure(storageDirectory: appleContainerAppSupportUrl, logger: app.logger)
+    await PodStore.shared.configure(storageDirectory: appleContainerAppSupportUrl)
     let imageClient = ClientImageService(containerSystemConfig: systemConfig)
     let healthCheckClient = ClientHealthCheckService()
     let networkClient = ClientNetworkService()
@@ -267,6 +268,7 @@ func configure(_ app: Application) async throws {
         try app.register(collection: LibpodManifestModifyRoute(client: manifestClient))
         try app.register(collection: LibpodManifestDeleteRoute(client: manifestClient))
         try app.register(collection: LibpodManifestPushRoute(manifestClient: manifestClient, imageClient: imageClient))
+        try app.register(collection: LibpodPodRoute(runtime: .live(client: containerClient, networkClient: networkClient)))
     } else {
         app.logger.notice("Podman libpod API disabled via \(LibpodSupport.disableEnvironmentVariable)")
     }
