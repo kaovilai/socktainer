@@ -273,10 +273,10 @@ struct ContainerFilterTests {
         #expect(result.map(\.id) == ["a"])
     }
 
-    // MARK: - volume stub
+    // MARK: - volume
 
-    @Test("volume filter always returns empty (not implemented)")
-    func volumeFilterStub() throws {
+    @Test("volume filter excludes containers without a matching mount")
+    func volumeFilterNoMounts() throws {
         let containers = [try makeSnapshot(id: "a"), try makeSnapshot(id: "b")]
         let result = ClientContainerService.applyFilters(
             containers, filters: ["volume": ["some-vol"]])

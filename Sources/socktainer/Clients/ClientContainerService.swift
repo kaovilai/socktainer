@@ -194,6 +194,18 @@ struct ClientContainerService: ClientContainerProtocol {
         pool.first { $0.id == reference } ?? pool.first { DockerContainerID.hexId(for: $0).hasPrefix(reference) }
     }
 
+    /// moby's `volume` filter: a container matches when any value names one of its mounts —
+    /// by mount destination, by volume name, or (for a bind mount, which has no name) by
+    /// host source path.
+    static func matchesVolumeFilter(_ container: ContainerSnapshot, values: [String]) -> Bool {
+        let mounts = ContainerMountPoint.dockerMounts(for: container.configuration)
+        return values.contains { value in
+            mounts.contains { mount in
+                mount.destination == value || (mount.name ?? mount.source) == value
+            }
+        }
+    }
+
     /// Applies parsed Docker container filters to a snapshot list.
     /// `allContainers` is the unfiltered set used by `before`/`since` for
     /// relative ordering; defaults to `containers` when not available.
@@ -278,7 +290,7 @@ struct ClientContainerService: ClientContainerProtocol {
                 // so we skip it here to avoid a stale heuristic.
                 break
             case "volume":
-                result = result.filter { _ in false }
+                result = result.filter { matchesVolumeFilter($0, values: values) }
             case "expose":
                 result = result.filter { container in
                     let exposedPorts = container.configuration.publishedPorts.map { "\($0.containerPort)/\($0.proto.rawValue)" }

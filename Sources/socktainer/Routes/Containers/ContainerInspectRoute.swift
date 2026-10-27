@@ -143,42 +143,7 @@ extension ContainerInspectRoute {
                 Shell: nil  // no mechanism to derive this value
             )
 
-            let bindVolumeNames = LocalBindVolume.volumeNames(labels: container.configuration.labels)
-            let mounts = container.configuration.mounts.map { mount in
-                let mountType: String
-                let mountName: String?
-
-                switch mount.type {
-                case .block(_, _, _):
-                    mountType = "bind"
-                    mountName = nil
-                case .volume(let name, _, _, _):
-                    mountType = "volume"
-                    mountName = name
-                case .virtiofs:
-                    // A bind-backed named volume is shared over virtiofs but is still a volume.
-                    let volumeName = bindVolumeNames[mount.destination]
-                    mountType = volumeName == nil ? "bind" : "volume"
-                    mountName = volumeName
-                case .tmpfs:
-                    mountType = "tmpfs"
-                    mountName = nil
-                }
-
-                let isReadonly = mount.options.readonly
-                let mode = isReadonly ? "ro" : "rw"
-
-                return ContainerMountPoint(
-                    type: mountType,
-                    name: mountName,
-                    source: mount.source,
-                    destination: mount.destination,
-                    driver: nil,  // we do not take into account any storage driver at this time
-                    mode: mode,
-                    rw: !isReadonly,
-                    propagation: ""
-                )
-            }
+            let mounts = ContainerMountPoint.dockerMounts(for: container.configuration)
 
             let publishedPorts = Dictionary(grouping: container.configuration.publishedPorts, by: { "\($0.containerPort)/\($0.proto.rawValue)" })
                 .mapValues { bindings in
