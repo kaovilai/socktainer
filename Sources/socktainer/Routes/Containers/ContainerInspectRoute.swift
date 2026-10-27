@@ -33,6 +33,19 @@ extension ContainerInspectRoute {
         return published.isEmpty ? nil : published
     }
 
+    /// Docker's `Config.Entrypoint` / `Config.Cmd` are the image's merged with the request, which
+    /// Apple Container flattens into one process; the create route persists the split in a label.
+    /// A container created without it reports its executable as the entrypoint and the rest as the command.
+    static func configCommand(labels: [String: String], process: ProcessConfiguration) -> ContainerCreateRoute.PersistedCommand {
+        if let json = labels[ContainerCreateRoute.commandLabel],
+            let persisted = try? JSONDecoder().decode(ContainerCreateRoute.PersistedCommand.self, from: Data(json.utf8))
+        {
+            return persisted
+        }
+        return ContainerCreateRoute.PersistedCommand(
+            Entrypoint: [process.executable], Cmd: process.arguments.isEmpty ? nil : process.arguments)
+    }
+
     /// Apple Container only reports live network attachments while a
     /// container is running (`container.networks` is hardcoded to `[]` once
     /// stopped), whereas Docker's `NetworkSettings.Networks` reflects the
@@ -96,6 +109,8 @@ extension ContainerInspectRoute {
                 await RestartPolicyManager.effectivePolicy(hexId: DockerContainerID.hexId(for: container), labels: container.configuration.labels)
                 ?? RestartPolicy(Name: "no", MaximumRetryCount: nil)
 
+            let command = Self.configCommand(labels: container.configuration.labels, process: container.configuration.initProcess)
+
             let containerConfig: ContainerConfig = ContainerConfig(
                 // The create route stores the requested hostname on the network attachment.
                 Hostname: container.configuration.networks.first?.options.hostname ?? container.id,
@@ -109,13 +124,13 @@ extension ContainerInspectRoute {
                 OpenStdin: false,  // no mechanism to derive this value
                 StdinOnce: false,  // no mechanism to derive this value
                 Env: container.configuration.initProcess.environment.isEmpty ? nil : container.configuration.initProcess.environment,
-                Cmd: container.configuration.initProcess.arguments.isEmpty ? nil : container.configuration.initProcess.arguments,
+                Cmd: command.Cmd,
                 Healthcheck: healthcheckConfig,
                 ArgsEscaped: false,  // no mechanism to derive this value
                 Image: container.configuration.image.reference,
                 Volumes: nil,  // Could be derived from mounts if needed
                 WorkingDir: container.configuration.initProcess.workingDirectory.isEmpty ? nil : container.configuration.initProcess.workingDirectory,
-                Entrypoint: [container.configuration.initProcess.executable],
+                Entrypoint: command.Entrypoint,
                 NetworkDisabled: container.configuration.networks.isEmpty,
                 MacAddress: nil,  // no mechanism to derive this value
                 OnBuild: nil,  // no mechanism to derive this value
