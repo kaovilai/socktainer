@@ -21,15 +21,33 @@ Routes that only wrap a Docker-compat route which is itself unimplemented say so
 Verified on macOS 26.6.2 with Apple Container 1.6.0 (matching this build) and `podman` 6.1.4:
 about 230 `podman` commands (including attached `podman run`/`start -a`) across handshake, images, volumes, networks, containers (lifecycle,
 exec, logs, stats, cp, filters, formats, error mapping, ~40 `run` flags), `build` (single and
-multi-platform, Rosetta and QEMU builders), push to a local registry, and manifest lists.
+multi-platform, Rosetta and QEMU builders), push to a local registry, manifest lists, top, pause,
+healthcheck run, commit, diff, export, save/load, events filters and replay, pods, and
+podman-compose 1.6.0 (with and without `--in-pod`); the Docker CLI (with Compose v2.39.4) was run
+through the same features.
 
-Limits that Docker-compat shares (libpod mirrors Docker-compat's support, it does not go beyond it). `events --filter` is still ignored, and `events --since` has no history to replay (it only drops older events):
+Limits that Docker-compat shares (libpod mirrors Docker-compat's support, it does not go beyond it):
 
-- `top`, `commit`, `diff`, `pause`/`unpause` and `manifest annotate` are not implemented (Docker-compat
-  has no implementation either); `rename` only works before the first start.
-- Inspect reports `Config.Entrypoint`/`Config.Cmd` as the process's executable and arguments (`sleep` / `[300]`) rather
-  than the original create request (`null` / `[sleep 300]`), since only the resulting process is stored.
-- `podman save` fails with "ContentStore missing blob data", an Apple Container image-store limitation.
+- `rename` works on any container that is not running; renaming a running one is a 409, since Apple
+  Container cannot change the id of a running container.
+- `top` runs `ps` inside the container (there is no host-side view of the VM's processes), so the
+  image must provide `ps` (busybox or procps); one without it (distroless, debian-slim) is a 500 that
+  says so.
+- `pause`/`unpause` stop every process with SIGSTOP and resume it with SIGCONT (Apple Container has
+  no freezer or pause primitive). Paused state is kept in memory, so a daemon restart forgets it; an
+  image without a shell gets only PID 1 stopped.
+- `commit` writes the container's whole filesystem as one squashed layer on the base image's config
+  (Apple Container keeps no separate writable layer); the container is not paused while it is read,
+  its guest page cache is flushed first, as for `export`.
+- `diff` compares the container's `rootfs.ext4` with the image snapshot it was cloned from;
+  `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` are hidden as Docker's init layer hides them.
+- `events --since`/`--until` replay an in-memory ring of recent events (last 1000 by default,
+  `SOCKTAINER_EVENTS_HISTORY`, 0 disables), which a daemon restart empties.
+- `save` without `--platform` exports only the platforms whose content is in the local store.
+- `manifest annotate` sets architecture, OS, variant and annotations (instance and `--index`);
+  `--os-version`, `--os-features` and `--features` are a 400, since the image store cannot encode them.
+- A named volume cannot be mounted by two running containers at once (Apple Virtualization rejects a
+  second attachment of the same block device: "The storage device attachment is invalid").
 - `podman cp` out of a container to a host path under `/tmp` fails inside the podman client on macOS
   (`/tmp` is a symlink to `/private/tmp`); copying to a real directory works.
 
@@ -57,20 +75,21 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 | `podman rm` | DELETE `/libpod/containers/{id}` | ✅ |
 | `podman inspect` (container) | GET `/libpod/containers/{id}/json` | ✅ |
 | `podman logs` | GET `/libpod/containers/{id}/logs` | ✅ |
-| `podman top` | GET `/libpod/containers/{id}/top` | ✅ (wraps `ContainerTopRoute`, which itself returns "not implemented") |
-| `podman rename` | POST `/libpod/containers/{id}/rename` | ✅ (only containers that have never been started, as Docker-compat) |
-| `podman wait` | POST `/libpod/containers/{id}/wait` | ✅ |
-| `podman attach` | POST `/libpod/containers/{id}/attach` | ✅ |
-| `podman exec` (create+start) | POST `/libpod/containers/{id}/exec`, `/libpod/exec/{id}/start`, GET `/libpod/exec/{id}/json`, POST `/libpod/exec/{id}/remove` | ✅ |
+| `podman top` | GET `/libpod/containers/{id}/top` | ✅ (psgo descriptors mapped onto `ps -o`; `%CPU` computed as psgo does; plain `ps` arguments passed through) |
+| `podman rename` | POST `/libpod/containers/{id}/rename` | ✅ (any container that is not running, as Docker-compat) |
+| `podman wait` | POST `/libpod/containers/{id}/wait` | ✅ (several `condition`s are ORed; `stopped`/`exited`/`removing`, plus `running`, `created`/`configured`, `paused`, `healthy`/`unhealthy` answering -1 as podman does; `interval` honoured; `stopping`/`unknown` are 501) |
+| `podman attach` | POST `/libpod/containers/{id}/attach` | ✅ (stdin reaches a running container started with `-i`; detach keys honoured, default ctrl-p,ctrl-q) |
+| `podman exec` (create+start) | POST `/libpod/containers/{id}/exec`, `/libpod/exec/{id}/start`, GET `/libpod/exec/{id}/json`, POST `/libpod/exec/{id}/remove` | ✅ (`exec -t` keeps the session's terminal setting, like podman, whatever the start body says) |
+| terminal resize (`run -it`, `attach`, `exec -it`) | POST `/libpod/containers/{id}/resize`, `/libpod/exec/{id}/resize` | ✅ (a resize before start is applied once the process starts) |
 | `podman stats` | GET `/libpod/containers/stats` (batch, what the CLI calls) and `/libpod/containers/{name}/stats` | ✅ |
-| `podman pause` | POST `/libpod/containers/{name}/pause` | ✅ (wraps `ContainerPauseRoute`, which itself returns "not supported" — Apple Container has no pause primitive) |
-| `podman unpause` | POST `/libpod/containers/{name}/unpause` | ✅ (same caveat as pause) |
+| `podman pause` | POST `/libpod/containers/{name}/pause` | ✅ (SIGSTOP to every process; inspect/ps report paused) |
+| `podman unpause` | POST `/libpod/containers/{name}/unpause` | ✅ |
 | `podman container prune` | POST `/libpod/containers/prune` | ✅ |
 | `podman update` | POST `/libpod/containers/{name}/update` | ✅ |
-| `podman commit` | POST `/libpod/commit` | ✅ (wraps `CommitRoute`, which itself returns "not implemented") |
-| `podman export` | GET `/libpod/containers/{name}/export` | ✅ |
-| `podman diff` | GET `/libpod/containers/{name}/changes` | ✅ (wraps `ContainerChangesRoute`, which itself returns "not implemented") |
-| `podman healthcheck run` | GET `/libpod/containers/{name}/healthcheck` (libpod-only, no Docker-compat equivalent) | ❌ still missing (no Docker-side route to wrap) |
+| `podman commit` | POST `/libpod/commit` | ✅ (single squashed layer; `changes`, including the `CMD=` shorthand; streamed or not) |
+| `podman export` | GET `/libpod/containers/{name}/export` | ✅ (a running container's guest is flushed first) |
+| `podman diff` (container) | GET `/libpod/containers/{name}/changes` | ✅ (moby `ChangesDirs` semantics) |
+| `podman healthcheck run` | GET `/libpod/containers/{name}/healthcheck` (libpod-only) | ✅ (one run of the configured check through the scheduled probe; updates `State.Health`; 409 without a healthcheck or when not running) |
 | `podman cp` | GET/HEAD/PUT `/libpod/containers/{name}/archive` | ✅ |
 
 ## Images
@@ -87,8 +106,10 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 | `podman search` | GET `/libpod/images/search` | ✅ |
 | `podman history` | GET `/libpod/images/{name}/history` | ✅ |
 | `podman image prune` | POST `/libpod/images/prune` (confirmed in podman source) | ✅ |
-| `podman save` | GET `/libpod/images/{name}/get` (single) or `/libpod/images/export?references=...` (multi) | ✅ |
+| `podman save` | GET `/libpod/images/{name}/get` (single) or `/libpod/images/export?references=...` (multi) | ✅ (platforms whose content is local) |
 | `podman load` | POST `/libpod/local/images/load` (confirmed in podman source — note: NOT `/libpod/images/load`) | ✅ |
+| `podman untag` | POST `/libpod/images/{name}/untag` | ✅ |
+| `podman image diff` | GET `/libpod/images/{name}/changes` | ❌ 501: Apple Container unpacks one filesystem per image, with no parent snapshot to compare against |
 | `podman import` | POST `/libpod/images/import` (confirmed in podman source: query params are `reference`/`message`/`changes`/`url`, not Docker's `repo`/`tag`/`fromSrc`) | ✅ (translates libpod's `reference` query param into Docker's `repo`/`tag`/`fromSrc=-` shape, then delegates; `url`-based remote import still rejected, same limitation as the Docker-side route) |
 
 ## Volumes
@@ -118,7 +139,7 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 | Command | Method + Path | Implemented |
 |---|---|---|
 | `podman system df` | GET `/libpod/system/df` | ✅ |
-| `podman events` | GET `/libpod/events` | ✅ |
+| `podman events` | GET `/libpod/events` | ✅ (`filters` with podman's semantics, `since`/`until` replay recent history, `stream=false`; Docker actions renamed to podman's: `died`, `remove`, `exec_died`, `health_status`, ...; network connect/disconnect name the container) |
 | `podman login` (auth check) | POST `/libpod/auth` | ✅ |
 
 ## Manifest lists (multi-arch)
@@ -169,14 +190,35 @@ back-to-back to narrow, not close, the window.
 | `podman manifest add` | PUT `/libpod/manifests/{name}` (`operation: "update"`) | ✅ |
 | `podman manifest remove` | PUT `/libpod/manifests/{name}` (`operation: "remove"`) | ✅ |
 | `podman manifest rm` | DELETE `/libpod/manifests/{name}` | ✅ |
-| `podman manifest annotate` | PUT `/libpod/manifests/{name}` (`operation: "annotate"`) | ❌ not implemented (index-level annotations only, rarely used) |
+| `podman manifest annotate` | PUT `/libpod/manifests/{name}` (`operation: "annotate"`) | ✅ (arch/os/variant/annotations, `--index`; `--os-version`/`--os-features`/`--features` are a 400) |
 | `podman manifest push` | POST `/libpod/manifests/{name}/registry/{destination}` (v4+) and legacy POST `/libpod/manifests/{name}/push?destination=` | ✅ (both forms) |
 | `podman build --manifest <name>` | server-side: build all requested platforms and register the result under a named, addressable manifest list | ✅ |
 
+## Pods
+
+Apple Container has no pod primitive and runs every container in its own VM, so a pod here is a
+named group of containers (label `io.socktainer.pod`, store `socktainer-pods.json` in the
+Application Support directory) on a per-pod network `pod-<name>`, where members reach each other by
+name. Members share no network, IPC, UTS or PID namespace (no `localhost` between them) and there is
+no infra container; pod-level published ports (`pod create -p`) are a 400 — publish on the member
+containers instead.
+
+| Command | Method + Path | Implemented |
+|---|---|---|
+| `podman pod create` | POST `/libpod/pods/create` | ✅ |
+| `podman pod exists` / `inspect` | GET `/libpod/pods/{name}/exists`, `/libpod/pods/{name}/json` | ✅ |
+| `podman pod ps` | GET `/libpod/pods/json` (filters `id`/`name`/`label`/`status`/`network`) | ✅ |
+| `podman pod start` / `stop` / `restart` / `kill` | POST `/libpod/pods/{name}/start|stop|restart|kill` | ✅ |
+| `podman pod rm` / `prune` | DELETE `/libpod/pods/{name}`, POST `/libpod/pods/prune` | ✅ |
+| `podman run --pod`, `podman ps --pod` | container create joins the pod; list/inspect report `Pod`/`PodName` | ✅ |
+| `podman pod top` / `stats` / `pause` / `unpause` / `clone` / `logs` | | ❌ 404 |
+
+podman-compose 1.6.0 in-pod `up -d`/`ps`/`down` works.
+
 ## Not applicable / intentionally out of scope
 
-- `podman pod *`, `podman generate kube`, `podman play kube` — Apple Container
-  has no pod primitive; skip unless a future need surfaces.
+- `podman generate kube`, `podman play kube` — skip unless a future need
+  surfaces.
 - `podman machine *` — client-side only, never reaches the socket. Confirmed
   out of scope per the ask.
 - `podman unshare`, `podman system connection *`, `podman completion` — purely
@@ -193,38 +235,17 @@ back-to-back to narrow, not close, the window.
 - `{resource}/exists` endpoints: `/libpod/containers/{name}/exists`,
   `/libpod/images/{name}/exists`, `/libpod/volumes/{name}/exists`,
   `/libpod/networks/{name}/exists` all return 204 (exists) or 404 (not found).
-- `podman untag` — likely handled by the same `/libpod/images/{name}/tag`
-  machinery in reverse or a dedicated untag call; low priority, rarely used.
 - `podman generate systemd` — out of scope (systemd unit generation is a
   Linux-host concept, not meaningful under Apple Container).
-- All-container `/libpod/containers/stats` (no name): the per-container
-  `/libpod/containers/{name}/stats` above is real podman server behavior
-  (confirmed: podman's own route registration uses the Docker-compat handler
-  for that deprecated per-container path). The all-container variant is
-  genuinely different — it uses libpod's own `ContainerStats` schema
-  (`CPU`/`MemPerc`/`UpTime` as pre-computed values, not raw counters podman
-  computes percentages from) which needs host-CPU-time accounting and
-  container start-time tracking this codebase doesn't currently have.
-  Deliberately not implemented with fabricated/approximated values for those
-  fields — flagging as a real gap rather than shipping a wrong-looking-right
-  response.
+- `podman wait --condition stopping|unknown` — 501; this daemon has no
+  distinct stopping state to wait for.
 
 ## Top gaps worth implementing next (priority order)
 
-1. **`podman healthcheck run`** — the one genuine blocker. Unlike
-   every other gap in this doc, there is no existing Docker-side route to
-   delegate to: real `podman healthcheck run <container>` executes the
-   container's configured healthcheck test command right now and reports
-   the result, whereas `HealthCheckManager` (`Sources/socktainer/Utilities/HealthCheckManager.swift`)
-   only exposes `start`/`stop`/`currentHealth(for:)` — a background poll loop
-   and its last cached result, not an on-demand single run. Implementing
-   this properly needs new exec-based invocation logic (parse the
-   container's `HealthcheckConfig.test`, run it via the container-exec path
-   with the configured timeout, map the exit code to Healthy/Unhealthy, and
-   shape the response per libpod's `HealthcheckRunResult` schema) — real
-   feature work, not a route wrapper. Flagging rather than half-implementing
-   it as "just return `currentHealth`", which would silently diverge from
-   what `podman healthcheck run` actually means (a fresh probe, not a cached
-   status read).
-2. Remaining low priority: `podman untag`, `podman manifest annotate`,
-   all-container `/libpod/containers/stats`.
+1. **`podman image diff`** (`/libpod/images/{name}/changes`) — would need the
+   top layer's tar walked against the layers below it, since the store keeps
+   no per-layer snapshot.
+2. Pod `top`/`stats`/`pause`/`unpause`/`logs`/`clone` — fan-outs over the
+   per-container routes that already exist.
+3. Shared named volumes between running containers — blocked on Apple
+   Virtualization's one-attachment-per-block-device rule.

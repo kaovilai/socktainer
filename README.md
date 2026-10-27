@@ -285,10 +285,11 @@ fi
 - Built on **Apple’s Container Framework** 🍏
 - Provides **Docker REST API compatibility** 🔄 (partial)
 - Listens on a Unix domain socket `$HOME/.socktainer/container.sock` and auto-registers a `socktainer` Docker context
-- Supports container lifecycle operations: inspect, stop, remove 🛠️
-- Supports image listing, pulling, deletion, logs, health checks, container stats. Exec without interactive mode 📄
+- Supports container lifecycle operations: create, start, stop, kill, restart, pause/unpause, rename, remove, wait 🛠️
+- Supports image listing, pulling, building, pushing, deletion, save/load, import, commit, logs, health checks, container stats, `top`, `diff`, `export` and interactive exec/attach 📄
+- Serves the **podman libpod API** too (`podman --remote`, podman-compose), including pods, manifest lists and `podman healthcheck run` — see [PODMAN_API_AUDIT.md](PODMAN_API_AUDIT.md)
 - `docker stats` reports memory against the Apple Container VM limit (configurable via `--memory`, default 1 GiB per container), not the host RAM
-- Broadcasts container events for client liveness monitoring 📡
+- Broadcasts container, image, network and volume events, with `filters` and `since`/`until` replay of recent history 📡
 
 ---
 
@@ -542,12 +543,16 @@ Ownership rules:
 
 - `docker update` supports **restart policies only** (`--restart`). CPU and memory limits cannot change after create — Apple Container runs each container in a VM whose resources are fixed at boot. Resource-only updates return an error; a restart-policy update combined with resource flags applies the policy and returns a warning for the ignored fields. Updated policies are stored durably, but the enforcement caveat above applies to them like any other restart policy.
 - `docker load` accepts tarballs from real Docker (plain, gzip or zstd compressed). Index entries whose blobs are not in the tarball are dropped on load — `docker save` on real Docker ships only the pulling platform's blobs while keeping the full multi-platform index, so only that platform is imported.
-- `docker save` works for images that were loaded from a tarball, and the `docker save | docker load` round-trip is supported. It fails with `ContentStore missing blob data` for **registry-pulled** images: Apple's Containerization pull stores the image's full multi-platform index but downloads only the local platform's blobs, and save exports the whole index ([platform limitation](https://github.com/apple/containerization)).
-- `docker rename` works only for containers that have **never been started**, which covers Compose recreation (it renames its new replacement before starting it). Apple Container has no rename and names a container by its id, so socktainer recreates the container under the new name, keeping its Docker ID. A container that has run keeps a writable root filesystem that recreating would lose, so renaming it returns `409 Conflict`.
-- `docker pause` / `docker unpause` are **not supported** — there is no freezer/checkpoint equivalent for Apple Container VMs.
+- `docker save` exports the platforms whose content is in the local store (registry pulls download only the local platform's blobs, though the index lists them all), and the `docker save | docker load` round-trip is supported. The archive's `manifest.json` names the host platform's image, or the one requested with `--platform`.
+- `docker rename` works for any container that is **not running**. Apple Container has no rename and names a container by its id, so socktainer recreates the container under the new name, keeping its Docker ID and carrying its root filesystem and log across. A running container's VM holds its bundle, so renaming it returns `409 Conflict`.
+- `docker pause` / `docker unpause` stop and resume every process in the container with SIGSTOP/SIGCONT, as there is no freezer/checkpoint equivalent for Apple Container VMs. The paused state lives in the `socktainer` process and is forgotten when it restarts; in an image without a shell only PID 1 is stopped.
+- `docker top` runs `ps` inside the container, so the image must provide one (busybox or procps).
+- `docker commit` writes the container's filesystem as a **single squashed layer** on top of the base image's config, since Apple Container keeps no separate writable layer; `--pause` has no effect (the guest's page cache is flushed before the filesystem is read, as for `docker export`). `docker diff` compares the container's filesystem with the image it was created from.
+- A named volume cannot be mounted by two **running** containers at once: Apple Virtualization rejects a second attachment of the same block device ("The storage device attachment is invalid").
 - `docker network connect` / `disconnect` are accepted as **no-ops**: Virtualization.framework offers no NIC hotplug and Apple Container has no post-create attach API, so network membership is fixed at container create. Containers on user-created networks reach each other by name through socktainer's DNS, which covers the common Compose use.
 - **Static container IPs** (`--ip`, IPAM per-container config) cannot be honored: Apple Container assigns addresses from a rotating allocator with no way to request a specific one. Name-based discovery via socktainer DNS is the supported alternative; addresses stay stable for a container's lifetime.
-- Not yet implemented (endpoints answer an explicit error instead of pretending): `docker commit`, `docker diff`, `docker search`, `docker top`, and `GET /distribution/{name}/json`.
+- `podman pod` groups containers on a shared pod network, but each member still runs in its own VM: members share no `localhost`, IPC or PID namespace, and there is no infra container.
+- Endpoints socktainer does not implement answer an explicit error instead of pretending.
 
 ### Docker Compose — inter-service DNS
 
