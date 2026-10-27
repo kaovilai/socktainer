@@ -12,10 +12,14 @@ actor ContainerExitCodeStore {
     static let shared = ContainerExitCodeStore()
 
     private var codes: [String: Int32] = [:]
+    /// How many codes have been recorded per id, so a wait for the *next* exit can tell a code
+    /// recorded after it began from one left over by an earlier run.
+    private var generations: [String: Int] = [:]
     private var waiters: [String: [CheckedContinuation<Int32, Never>]] = [:]
 
     func set(id: String, code: Int32) {
         codes[id] = code
+        generations[id, default: 0] += 1
         // Resume anyone awaiting this container's exit code (e.g. the die-event observer),
         // delivering the authoritative recorded value rather than a timed-poll fallback.
         if let pending = waiters.removeValue(forKey: id) {
@@ -29,6 +33,16 @@ actor ContainerExitCodeStore {
 
     func remove(id: String) {
         codes.removeValue(forKey: id)
+    }
+
+    /// The number of codes recorded for `id` so far; pass it to `get(id:recordedAfter:)`.
+    func generation(id: String) -> Int {
+        generations[id] ?? 0
+    }
+
+    /// The code for `id`, but only one recorded after `generation` was read.
+    func get(id: String, recordedAfter generation: Int) -> Int32? {
+        (generations[id] ?? 0) > generation ? codes[id] : nil
     }
 
     /// Suspends until the exit code for `id` is recorded, returning the exact recorded value.
