@@ -45,6 +45,7 @@ func configure(_ app: Application) async throws {
     let registryClient = ClientRegistryService()
     let archiveClient = ClientArchiveService(appSupportPath: appleContainerAppSupportUrl)
     let builderClient = ClientBuilderService(appSupportURL: appleContainerAppSupportUrl, containerSystemConfig: systemConfig)
+    let commandRunner = ClientContainerCommandRunnerService()
 
     // Create and install regex routing middleware with logging
     let regexRouter = app.regexRouter(with: app.logger)
@@ -83,7 +84,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ContainerStartRoute(client: containerClient))
     try app.register(collection: ContainerStatsRoute(client: containerClient))
     try app.register(collection: ContainerStopRoute(client: containerClient))
-    try app.register(collection: ContainerTopRoute())
+    try app.register(collection: ContainerTopRoute(client: containerClient, runner: commandRunner))
     try app.register(collection: ContainerUnpauseRoute())
     try app.register(collection: ContainerUpdateRoute(client: containerClient))
     try app.register(collection: ContainerWaitRoute(client: containerClient))
@@ -210,7 +211,7 @@ func configure(_ app: Application) async throws {
         try app.register(collection: LibpodImageTagRoute(systemConfig: systemConfig))
         try app.register(collection: LibpodBuildRoute(client: containerClient, builderClient: builderClient, systemConfig: systemConfig, manifestClient: manifestClient))
         try app.register(collection: LibpodContainerLogsRoute(client: containerClient))
-        try app.register(collection: LibpodContainerTopRoute())
+        try app.register(collection: LibpodContainerTopRoute(client: containerClient, runner: commandRunner))
         try app.register(collection: LibpodContainerRenameRoute(client: containerClient))
         try app.register(collection: LibpodContainerRestartRoute(client: containerClient))
         try app.register(collection: LibpodExecCreateRoute(client: containerClient))
