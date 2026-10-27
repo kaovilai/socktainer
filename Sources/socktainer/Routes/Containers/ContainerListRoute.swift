@@ -128,7 +128,13 @@ extension ContainerListRoute {
                         baseStatus = "Up"
                     }
                 case .stopped:
-                    baseStatus = container.isNeverStarted ? "Created" : "Exited"
+                    if container.isNeverStarted {
+                        baseStatus = "Created"
+                    } else if let code = await ContainerExitCodeStore.shared.get(id: container.id) {
+                        baseStatus = "Exited (\(max(code, 0)))"
+                    } else {
+                        baseStatus = "Exited"
+                    }
                 default:
                     baseStatus = mobyState
                 }

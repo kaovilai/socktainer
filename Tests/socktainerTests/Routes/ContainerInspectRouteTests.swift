@@ -387,6 +387,28 @@ struct ContainerInspectRouteRestartPolicyTests {
         }
     }
 
+    @Test("an exited container reports the exit code socktainer recorded for it")
+    func exitedReportsRecordedExitCode() async throws {
+        let nativeId = "exit-code-inspect"
+        await ContainerExitCodeStore.shared.set(id: nativeId, code: 7)
+        let snapshot = makeSnapshot(nativeId: nativeId)
+        let mock = InspectMock(snapshot: snapshot)
+
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: mock))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(nativeId)/json") { res async throws in
+                let inspect = try res.content.decode(RESTContainerInspect.self)
+                #expect(inspect.State.Status == "exited")
+                #expect(inspect.State.ExitCode == 7)
+            }
+        }
+        await ContainerExitCodeStore.shared.remove(id: nativeId)
+    }
+
     @Test("State.Restarting is false and Status is unaffected when no restart is pending")
     func noPendingRestartLeavesStateUnaffected() async throws {
         let nativeId = "inspect-no-pending-restart-ctr"

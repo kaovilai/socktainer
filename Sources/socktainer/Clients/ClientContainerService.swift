@@ -42,6 +42,14 @@ actor ContainerExitCodeStore {
         }
     }
 
+    /// The exit code recorded for `container`'s last run, or 0 when none is known (socktainer keeps
+    /// them in memory, so a container that exited before this daemon started has none). The
+    /// "could not obtain" sentinel is reported as 0 too.
+    static func recordedExitCode(for container: ContainerSnapshot) async -> Int32 {
+        let code = await shared.get(id: container.id) ?? 0
+        return max(code, 0)
+    }
+
     /// Sentinel recorded when the init process's exit code could not be obtained after retries.
     /// Distinguishes "wait failed" from a genuine exit code of 0.
     static let waitFailureSentinel: Int32 = -1
