@@ -7,24 +7,104 @@ import Vapor
 /// Which running containers socktainer has paused, keyed by native ID. Each entry remembers the
 /// start of the run it paused, so a container that stopped and started again since no longer
 /// reads as paused without anything having to clear the entry.
+///
+/// The set is persisted next to socktainer's other per-container records: the processes stay
+/// SIGSTOPped across a daemon restart, so forgetting them would report a frozen container as
+/// running and refuse to unpause it.
 final class ContainerPauseState: Sendable {
     static let shared = ContainerPauseState()
+    static let fileName = "socktainer-paused.json"
 
-    private let paused = Mutex<[String: Date?]>([:])
+    private struct State {
+        var paused: [String: Date?] = [:]
+        var fileURL: URL?
+    }
+
+    private let state = Mutex<State>(State())
+    private let log = Logger(label: "socktainer.pause")
+
+    init(fileURL: URL? = nil) {
+        guard let fileURL else { return }
+        let loaded = Self.load(from: fileURL, log: log)
+        state.withLock {
+            $0.fileURL = fileURL
+            $0.paused = loaded
+        }
+    }
+
+    func configure(storageDirectory: URL) {
+        let url = storageDirectory.appendingPathComponent(Self.fileName)
+        let loaded = Self.load(from: url, log: log)
+        state.withLock {
+            $0.fileURL = url
+            $0.paused = loaded
+        }
+    }
 
     func markPaused(_ container: ContainerSnapshot) {
-        paused.withLock { $0[container.id] = .some(container.startedDate) }
+        update { $0[container.id] = .some(container.startedDate) }
     }
 
     func markUnpaused(id: String) {
-        paused.withLock { _ = $0.removeValue(forKey: id) }
+        update { _ = $0.removeValue(forKey: id) }
     }
 
     func isPaused(_ container: ContainerSnapshot) -> Bool {
         guard container.status == .running else { return false }
-        return paused.withLock { state in
-            guard let startedDate = state[container.id] else { return false }
-            return startedDate == container.startedDate
+        return state.withLock { state in
+            guard let startedDate = state.paused[container.id] else { return false }
+            return Self.sameStart(startedDate, container.startedDate)
+        }
+    }
+
+    /// IDs of the containers recorded as paused, whether or not they still are.
+    var recordedIDs: Set<String> {
+        state.withLock { Set($0.paused.keys) }
+    }
+
+    /// Drops every entry whose container is gone, stopped, or started again since it was paused,
+    /// given the containers that exist now. Run once at startup, after a restart of socktainer.
+    func reconcile(with containers: [ContainerSnapshot]) {
+        let current = Dictionary(containers.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        update { paused in
+            paused = paused.filter { id, startedDate in
+                guard let container = current[id], container.status == .running else { return false }
+                return Self.sameStart(startedDate, container.startedDate)
+            }
+        }
+    }
+
+    /// Start dates read back from JSON may differ from the live ones in the last bits of the
+    /// floating-point value, so they compare within a millisecond.
+    private static func sameStart(_ recorded: Date?, _ current: Date?) -> Bool {
+        switch (recorded, current) {
+        case (nil, nil): return true
+        case (let lhs?, let rhs?): return abs(lhs.timeIntervalSince(rhs)) < 0.001
+        default: return false
+        }
+    }
+
+    private func update(_ body: (inout [String: Date?]) -> Void) {
+        state.withLock { state in
+            let before = state.paused
+            body(&state.paused)
+            guard state.paused != before, let fileURL = state.fileURL else { return }
+            do {
+                try JSONEncoder().encode(state.paused.mapValues { $0?.timeIntervalSince1970 }).write(to: fileURL, options: .atomic)
+            } catch {
+                log.error("could not save paused containers to \(fileURL.path): \(error)")
+            }
+        }
+    }
+
+    private static func load(from url: URL, log: Logger) -> [String: Date?] {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+        do {
+            let stored = try JSONDecoder().decode([String: TimeInterval?].self, from: Data(contentsOf: url))
+            return stored.mapValues { $0.map { Date(timeIntervalSince1970: $0) } }
+        } catch {
+            log.error("could not load paused containers from \(url.path) — containers paused by an earlier run read as running: \(error)")
+            return [:]
         }
     }
 }
