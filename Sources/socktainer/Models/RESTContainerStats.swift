@@ -81,19 +81,22 @@ extension RESTContainerStats {
     /// Builds a Docker-compatible stats response from two Apple Container samples.
     /// `prev` is the earlier sample (maps to precpu_stats), `curr` is the latest.
     /// CPU total_usage is derived from cpuUsageUsec × 1000 (µs → ns).
-    /// system_cpu_usage is synthesised as numCPUs × elapsed nanoseconds so Docker
-    /// clients can compute the standard CPU% formula without dividing by zero.
+    /// system_cpu_usage is synthesised as numCPUs × nanoseconds since the host booted, a
+    /// cumulative counter like Docker's, so both samples carry one and Docker clients
+    /// compute the standard CPU% formula from their difference without dividing by zero.
     static func build(
         id: String,
         name: String,
         prev: ContainerResource.ContainerStats,
         curr: ContainerResource.ContainerStats,
         prevRead: Date,
-        currRead: Date
+        currRead: Date,
+        hostBootDate: Date = Date(timeIntervalSinceNow: -ProcessInfo.processInfo.systemUptime)
     ) -> RESTContainerStats {
         let numCPUs = hostCPUCoreCount()
-        let elapsedNs = UInt64(max(0, currRead.timeIntervalSince(prevRead) * 1_000_000_000))
-        let systemCPU = UInt64(numCPUs) * elapsedNs
+        func systemCPU(at date: Date) -> UInt64 {
+            UInt64(numCPUs) * UInt64(max(0, date.timeIntervalSince(hostBootDate) * 1_000_000_000))
+        }
 
         func cpuStats(from sample: ContainerResource.ContainerStats, systemCPU: UInt64) -> CPUStats {
             let totalNs = (sample.cpuUsageUsec ?? 0) * 1000
@@ -140,8 +143,8 @@ extension RESTContainerStats {
             name: name,
             read: iso8601.string(from: currRead),
             preread: iso8601.string(from: prevRead),
-            cpu_stats: cpuStats(from: curr, systemCPU: systemCPU),
-            precpu_stats: cpuStats(from: prev, systemCPU: 0),
+            cpu_stats: cpuStats(from: curr, systemCPU: systemCPU(at: currRead)),
+            precpu_stats: cpuStats(from: prev, systemCPU: systemCPU(at: prevRead)),
             memory_stats: MemoryStats(
                 usage: curr.memoryUsageBytes,
                 limit: curr.memoryLimitBytes ?? hostPhysicalMemory(),
