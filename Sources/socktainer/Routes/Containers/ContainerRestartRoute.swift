@@ -36,6 +36,8 @@ extension ContainerRestartRoute {
             } catch ClientContainerError.ambiguousId(let reference, let matches) {
                 let matchList = matches.joined(separator: ", ")
                 throw Abort(.badRequest, reason: "ambiguous container reference \(reference): matches \(matchList)")
+            } catch let conflict as ExclusiveVolumeInUseError {
+                throw conflict
             } catch {
                 req.logger.error("Failed to restart container \(id): \(error)")
                 throw Abort(.internalServerError, reason: "Failed to restart container: \(error)")
