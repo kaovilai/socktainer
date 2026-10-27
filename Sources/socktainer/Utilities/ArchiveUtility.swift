@@ -71,8 +71,9 @@ struct ArchiveUtility {
         // Applied only after every entry is processed (see below the loop) — a directory's
         // recorded mode can be restrictive (e.g. read+execute only), and tar conventionally
         // lists a directory before its own contents, so applying it immediately could block
-        // creating that directory's later children.
-        var pendingDirectoryPermissions: [(path: String, mode: mode_t)] = []
+        // creating that directory's later children. Keyed by path so a later entry for the
+        // same directory replaces an earlier one's mode ("last entry wins").
+        var pendingDirectoryPermissions: [String: mode_t] = [:]
         // Allocated once and reused for every regular-file entry's copy loop, instead of a
         // fresh 128 KiB zero-filled array per entry — a real archive can contain thousands
         // of small files.
@@ -131,7 +132,12 @@ struct ArchiveUtility {
                 try fileManager.createDirectory(at: fullPath.deletingLastPathComponent(), withIntermediateDirectories: true)
                 // "Last entry wins", matching `.regular`/`.directory`/`.symbolicLink`.
                 try? fileManager.removeItem(at: fullPath)
-                guard link(linkSource.path, fullPath.path) == 0 else {
+                // `linkat` without `AT_SYMLINK_FOLLOW`, not `link`: macOS `link` follows a
+                // symlink at the source, so a hard-link entry naming a symlink (one extracted
+                // earlier, or one already in `destination` pointing at an absolute host path)
+                // would hard-link the symlink's TARGET — possibly a host file — into the tree.
+                // tar links the entry itself.
+                guard linkat(AT_FDCWD, linkSource.path, AT_FDCWD, fullPath.path, 0) == 0 else {
                     // ENOENT (the archive references a hard-link target that hasn't been
                     // extracted, e.g. malformed ordering) is an unsupported/malformed entry,
                     // not a host-side failure — anything else still deserves a hard failure.
@@ -167,7 +173,7 @@ struct ArchiveUtility {
                 // entry's recorded mode for the archive's own top-level directory (which can be
                 // arbitrarily restrictive) has no business overriding that.
                 if fullPath.standardizedFileURL.path != destinationPath {
-                    pendingDirectoryPermissions.append((fullPath.path, mode_t(entry.permissions & 0o777)))
+                    pendingDirectoryPermissions[fullPath.path] = mode_t(entry.permissions & 0o777)
                 }
             case .regular:
                 try fileManager.createDirectory(at: fullPath.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -226,6 +232,14 @@ struct ArchiveUtility {
                 // or copied elsewhere — baking in the transient extraction destination's own
                 // absolute path would leave the link dangling the moment that happens.
                 let isAbsoluteTarget = target.hasPrefix("/")
+                // A relative target is written to disk verbatim, so the kernel resolves its `..`
+                // physically: `a/b/s/..` climbs out of wherever the symlink `a/b/s` points, while
+                // the lexical checks below collapse it to the harmless `a/b`. Leading `..`s are
+                // fine (the checks see them); a `..` after a real component is not.
+                guard isAbsoluteTarget || !Self.hasInteriorParentReference(target) else {
+                    rejectedPaths.append(rawPath)
+                    continue
+                }
                 let resolvedTarget =
                     isAbsoluteTarget
                     ? destination.appendingPathComponent(String(target.dropFirst())).standardizedFileURL
@@ -280,11 +294,21 @@ struct ArchiveUtility {
         // Applied only now that every entry (including any of this directory's own children)
         // has already been created — a restrictive mode set immediately, per the comment on
         // `pendingDirectoryPermissions` above, could otherwise block creating later entries.
-        // Reversed (deepest child first): chmod'ing a path requires execute/search permission
-        // on every ancestor directory to resolve it — applying a restrictive parent mode
-        // before a still-pending child chmod underneath it could make that child's own path
-        // unresolvable.
-        for (path, mode) in pendingDirectoryPermissions.reversed() {
+        // Deepest path first, whatever order the archive listed them in: chmod'ing a path
+        // requires execute/search permission on every ancestor directory to resolve it —
+        // applying a restrictive parent mode before a still-pending child chmod underneath it
+        // could make that child's own path unresolvable.
+        let deepestFirst = pendingDirectoryPermissions.sorted {
+            $0.key.split(separator: "/").count > $1.key.split(separator: "/").count
+        }
+        for (path, mode) in deepestFirst {
+            // A later entry may have replaced the directory (or one of its ancestors) with a
+            // file or symlink, whose own mode wins; `lstat` and the ancestor check keep a
+            // symlink from redirecting this chmod onto some other path.
+            var info = stat()
+            guard lstat(path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR,
+                hasSafeAncestors(of: URL(fileURLWithPath: path), under: destination)
+            else { continue }
             try? fileManager.setAttributes([.posixPermissions: mode], ofItemAtPath: path)
         }
 
@@ -322,6 +346,19 @@ struct ArchiveUtility {
     /// checking while still being WRITTEN to disk as a portable, relative link — one that
     /// keeps resolving correctly if the extracted tree is later moved or copied elsewhere,
     /// unlike baking in the transient extraction destination's own absolute path.
+    /// Whether a relative symlink target has a `..` component after a normal one (`a/../b`).
+    static func hasInteriorParentReference(_ target: String) -> Bool {
+        var sawNormal = false
+        for component in target.split(separator: "/", omittingEmptySubsequences: true) where component != "." {
+            if component == ".." {
+                if sawNormal { return true }
+            } else {
+                sawNormal = true
+            }
+        }
+        return false
+    }
+
     private static func relativePath(from sourceDir: URL, to target: URL) -> String {
         let sourceComponents = sourceDir.standardizedFileURL.pathComponents
         let targetComponents = target.standardizedFileURL.pathComponents

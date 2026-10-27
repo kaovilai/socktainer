@@ -25,6 +25,15 @@ multi-platform, Rosetta and QEMU builders), push to a local registry, and manife
 
 Limits that Docker-compat shares (libpod mirrors Docker-compat's support, it does not go beyond it). `events --filter` is still ignored, and `events --since` has no history to replay (it only drops older events):
 
+- `podman logs --since/--until`: Docker-compat's logs route ignores both.
+- `podman stop`/`restart` without `--time` waits 5 seconds (podman and Docker default to 10).
+- Container inspect `Image` carries the image reference, not the image ID.
+- `container prune --filter label!=x` is rejected with 400 (the Docker-compat prune has no negative
+  label filter).
+- `network rm -f` and `volume rm -f` do not remove the containers using them; Docker-compat's force
+  has no such cleanup.
+- `podman update --env/--unset-env` and `podman volume create --uid/--gid` are refused (400): the
+  backend has no way to apply them.
 - `top`, `commit`, `diff`, `pause`/`unpause` and `manifest annotate` are not implemented (Docker-compat
   has no implementation either); `rename` only works before the first start.
 - Inspect reports `Config.Entrypoint`/`Config.Cmd` as the process's executable and arguments (`sleep` / `[300]`) rather
@@ -87,9 +96,9 @@ Currently registered in this repo: `Sources/socktainer/configure.swift`
 | `podman search` | GET `/libpod/images/search` | ✅ |
 | `podman history` | GET `/libpod/images/{name}/history` | ✅ |
 | `podman image prune` | POST `/libpod/images/prune` (confirmed in podman source) | ✅ |
-| `podman save` | GET `/libpod/images/{name}/get` (single) or `/libpod/images/export?references=...` (multi) | ✅ |
+| `podman save` | GET `/libpod/images/{name}/get` (single) or `/libpod/images/export?references=...` (multi) | ⚠️ route registered; real `podman save` currently fails with "ContentStore missing blob data" (see limits above) |
 | `podman load` | POST `/libpod/local/images/load` (confirmed in podman source — note: NOT `/libpod/images/load`) | ✅ |
-| `podman import` | POST `/libpod/images/import` (confirmed in podman source: query params are `reference`/`message`/`changes`/`url`, not Docker's `repo`/`tag`/`fromSrc`) | ✅ (translates libpod's `reference` query param into Docker's `repo`/`tag`/`fromSrc=-` shape, then delegates; `url`-based remote import still rejected, same limitation as the Docker-side route) |
+| `podman import` | POST `/libpod/images/import` (confirmed in podman source: query params are `reference`/`message`/`changes`/`url`, not Docker's `repo`/`tag`/`fromSrc`) | ✅ (decodes `reference` and calls the image client's import directly, answering with podman's single `{"Id": <digest>}` object instead of Docker's progress stream; `url`-based remote import still rejected, same limitation as the Docker-side route) |
 
 ## Volumes
 
@@ -165,7 +174,7 @@ back-to-back to narrow, not close, the window.
 |---|---|---|
 | `podman manifest create` | POST `/libpod/manifests/{name}` | ✅ |
 | `podman manifest inspect` | GET `/libpod/manifests/{name}/json` | ✅ |
-| `podman manifest exists` | GET `/libpod/manifests/{name}/exists` | ✅ |
+| `podman manifest exists` | GET `/libpod/manifests/{name}/exists` | ✅ (only lists made by `manifest create`/`add` or `build --manifest` count; an ordinary image is not a manifest list, as in podman) |
 | `podman manifest add` | PUT `/libpod/manifests/{name}` (`operation: "update"`) | ✅ |
 | `podman manifest remove` | PUT `/libpod/manifests/{name}` (`operation: "remove"`) | ✅ |
 | `podman manifest rm` | DELETE `/libpod/manifests/{name}` | ✅ |
@@ -197,17 +206,10 @@ back-to-back to narrow, not close, the window.
   machinery in reverse or a dedicated untag call; low priority, rarely used.
 - `podman generate systemd` — out of scope (systemd unit generation is a
   Linux-host concept, not meaningful under Apple Container).
-- All-container `/libpod/containers/stats` (no name): the per-container
-  `/libpod/containers/{name}/stats` above is real podman server behavior
-  (confirmed: podman's own route registration uses the Docker-compat handler
-  for that deprecated per-container path). The all-container variant is
-  genuinely different — it uses libpod's own `ContainerStats` schema
-  (`CPU`/`MemPerc`/`UpTime` as pre-computed values, not raw counters podman
-  computes percentages from) which needs host-CPU-time accounting and
-  container start-time tracking this codebase doesn't currently have.
-  Deliberately not implemented with fabricated/approximated values for those
-  fields — flagging as a real gap rather than shipping a wrong-looking-right
-  response.
+- `/libpod/containers/stats` reports `UpTime` as 0: each sample comes from the
+  Docker-compat stats handler, which carries no container uptime. The other
+  fields (`CPU`, `MemPerc`, ...) are computed from those samples the way
+  podman's client does.
 
 ## Top gaps worth implementing next (priority order)
 
@@ -226,5 +228,4 @@ back-to-back to narrow, not close, the window.
    it as "just return `currentHealth`", which would silently diverge from
    what `podman healthcheck run` actually means (a fresh probe, not a cached
    status read).
-2. Remaining low priority: `podman untag`, `podman manifest annotate`,
-   all-container `/libpod/containers/stats`.
+2. Remaining low priority: `podman untag`, `podman manifest annotate`.
