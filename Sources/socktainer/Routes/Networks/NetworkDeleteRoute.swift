@@ -1,4 +1,5 @@
 import ContainerAPIClient
+import ContainerizationError
 import Vapor
 
 struct NetworkDeleteRoute: RouteCollection {
@@ -34,6 +35,9 @@ struct NetworkDeleteRoute: RouteCollection {
                         attributes: ["name": summary?.Name ?? id, "type": summary?.Driver ?? "nat"]))
             }
             return Response(status: .noContent)
+        } catch let error as ContainerizationError where error.code == .notFound {
+            // Apple's error reads `notFound: "no network for id …"`, which the text match below misses.
+            throw Abort(.notFound, reason: "Network not found")
         } catch {
             if error.localizedDescription.contains("not found") {
                 throw Abort(.notFound, reason: "Network not found")
