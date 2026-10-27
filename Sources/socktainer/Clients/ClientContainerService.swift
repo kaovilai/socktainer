@@ -12,10 +12,14 @@ actor ContainerExitCodeStore {
     static let shared = ContainerExitCodeStore()
 
     private var codes: [String: Int32] = [:]
+    /// How many codes have been recorded per id, so a wait for the *next* exit can tell a code
+    /// recorded after it began from one left over by an earlier run.
+    private var generations: [String: Int] = [:]
     private var waiters: [String: [CheckedContinuation<Int32, Never>]] = [:]
 
     func set(id: String, code: Int32) {
         codes[id] = code
+        generations[id, default: 0] += 1
         // Resume anyone awaiting this container's exit code (e.g. the die-event observer),
         // delivering the authoritative recorded value rather than a timed-poll fallback.
         if let pending = waiters.removeValue(forKey: id) {
@@ -29,6 +33,16 @@ actor ContainerExitCodeStore {
 
     func remove(id: String) {
         codes.removeValue(forKey: id)
+    }
+
+    /// The number of codes recorded for `id` so far; pass it to `get(id:recordedAfter:)`.
+    func generation(id: String) -> Int {
+        generations[id] ?? 0
+    }
+
+    /// The code for `id`, but only one recorded after `generation` was read.
+    func get(id: String, recordedAfter generation: Int) -> Int32? {
+        (generations[id] ?? 0) > generation ? codes[id] : nil
     }
 
     /// Suspends until the exit code for `id` is recorded, returning the exact recorded value.
@@ -106,7 +120,7 @@ enum ClientContainerError: Error {
     case unsupportedCondition(ContainerWaitCondition)
     case invalidName(String)
     case nameConflict(String)
-    case renameRequiresUnstarted(id: String)
+    case renameRequiresStopped(id: String)
 }
 
 struct ClientContainerService: ClientContainerProtocol {
@@ -157,6 +171,12 @@ struct ClientContainerService: ClientContainerProtocol {
 
     static func isDNSSidecar(_ snapshot: ContainerSnapshot) -> Bool {
         snapshot.configuration.labels[NetworkDNSManager.roleLabel] == NetworkDNSManager.dnsRole
+    }
+
+    /// The container a `before`/`since` value names: Docker takes an exact name or an ID prefix,
+    /// never a name prefix (`since=web` must not pick `web-2`).
+    static func filterReference(_ reference: String, in pool: [ContainerSnapshot]) -> ContainerSnapshot? {
+        pool.first { $0.id == reference } ?? pool.first { DockerContainerID.hexId(for: $0).hasPrefix(reference) }
     }
 
     /// Applies parsed Docker container filters to a snapshot list.
@@ -212,10 +232,7 @@ struct ClientContainerService: ClientContainerProtocol {
             case "before":
                 result = result.filter { container in
                     for beforeId in values {
-                        if let beforeContainer = referencePool.first(where: {
-                            $0.id == beforeId || $0.id.hasPrefix(beforeId)
-                                || DockerContainerID.hexId(for: $0).hasPrefix(beforeId)
-                        }) {
+                        if let beforeContainer = filterReference(beforeId, in: referencePool) {
                             if let beforeTimestamp = AppleContainerTimestampResolver.containerCreationDate(beforeContainer),
                                 let containerTimestamp = AppleContainerTimestampResolver.containerCreationDate(container)
                             {
@@ -229,10 +246,7 @@ struct ClientContainerService: ClientContainerProtocol {
             case "since":
                 result = result.filter { container in
                     for sinceId in values {
-                        if let sinceContainer = referencePool.first(where: {
-                            $0.id == sinceId || $0.id.hasPrefix(sinceId)
-                                || DockerContainerID.hexId(for: $0).hasPrefix(sinceId)
-                        }) {
+                        if let sinceContainer = filterReference(sinceId, in: referencePool) {
                             if let sinceTimestamp = AppleContainerTimestampResolver.containerCreationDate(sinceContainer),
                                 let containerTimestamp = AppleContainerTimestampResolver.containerCreationDate(container)
                             {
@@ -525,10 +539,10 @@ struct ClientContainerService: ClientContainerProtocol {
 
     /// Apple Container has no rename and identifies containers by name, so a
     /// rename rebuilds the container under the new name, the same way staged
-    /// files are applied before start. Only a container that never booted can
-    /// be rebuilt without losing anything: one that ran has a private rootfs
-    /// the rebuild would discard. That covers Compose's recreate, which renames
-    /// its freshly created replacement before starting it.
+    /// files are applied before start. A container that ran has a private rootfs
+    /// (and log) in its bundle, which the rebuild carries over; one that is
+    /// running cannot be rebuilt. A never-started one covers Compose's recreate,
+    /// which renames its freshly created replacement before starting it.
     func rename(id: String, newName: String) async throws {
         let newId = ContainerNameUtility.sanitize(newName)
         guard ManagedContainer.nameValid(newId) else {
@@ -543,13 +557,8 @@ struct ClientContainerService: ClientContainerProtocol {
             if try await self.getContainerWithoutPreparationWait(id: newId)?.id == newId {
                 throw ClientContainerError.nameConflict(newId)
             }
-            let rootfs = AppleContainerTimestampResolver.appSupportURL
-                .appendingPathComponent("containers").appendingPathComponent(oldId)
-                .appendingPathComponent("rootfs.ext4")
-            guard container.status == .stopped, container.startedDate == nil,
-                !FileManager.default.fileExists(atPath: rootfs.path)
-            else {
-                throw ClientContainerError.renameRequiresUnstarted(id: oldId)
+            guard container.status == .stopped else {
+                throw ClientContainerError.renameRequiresStopped(id: oldId)
             }
 
             // Keep the Docker id: clients hold it across the rename (Compose starts by it).
@@ -562,31 +571,60 @@ struct ClientContainerService: ClientContainerProtocol {
             {
                 original.labels[timestampLabel] = String(created.timeIntervalSince1970)
             }
+            // The rebuilt container has not booted, so without this it would read as created.
+            if let started = container.lastStartedDate {
+                original.labels[ContainerSnapshot.startedAtLabel] = String(started.timeIntervalSince1970)
+            }
             let restore = original
             var configuration = original
             configuration.id = newId
             configuration.labels[DockerContainerID.idSeedLabel] = original.labels[DockerContainerID.idSeedLabel] ?? oldId
             let renamed = configuration
 
+            let bundles = AppleContainerTimestampResolver.appSupportURL.appendingPathComponent("containers")
+            let oldBundle = bundles.appendingPathComponent(oldId)
+            let newBundle = bundles.appendingPathComponent(newId)
             let kernel = try await ClientKernel.getDefaultKernel(for: .current)
             let options = await PreStartInjectionStore.shared.createOptions(containerId: oldId)
-            try await self.containerClient.withClient { try await $0.delete(id: oldId, force: true) }
+            let carried = try RenameCarryOver.stage(
+                from: oldBundle,
+                into: AppleContainerTimestampResolver.appSupportURL.appendingPathComponent("socktainer-rename")
+                    .appendingPathComponent(UUID().uuidString))
+            do {
+                try await self.containerClient.withClient { try await $0.delete(id: oldId, force: true) }
+            } catch {
+                try? carried?.land(in: oldBundle)
+                throw error
+            }
             do {
                 try await self.containerClient.withClient {
-                    try await $0.create(configuration: renamed, options: options, kernel: kernel)
+                    try await $0.create(
+                        configuration: renamed, options: carried?.createOptions(autoRemove: options.autoRemove, bundle: newBundle) ?? options,
+                        kernel: kernel)
                 }
+                try carried?.land(in: newBundle)
             } catch {
                 // Put the original back so a failed rename does not lose the container.
                 do {
+                    try? await self.containerClient.withClient { try await $0.delete(id: newId, force: true) }
                     try await self.containerClient.withClient {
-                        try await $0.create(configuration: restore, options: options, kernel: kernel)
+                        try await $0.create(
+                            configuration: restore,
+                            options: carried?.createOptions(autoRemove: options.autoRemove, bundle: oldBundle) ?? options,
+                            kernel: kernel)
                     }
+                    try carried?.land(in: oldBundle)
                 } catch {
                     throw ClientContainerError.notFound(id: oldId)
                 }
                 throw error
             }
             try await PreStartInjectionStore.shared.move(from: oldId, to: newId)
+            // Exit codes are kept by name.
+            if let code = await ContainerExitCodeStore.shared.get(id: oldId) {
+                await ContainerExitCodeStore.shared.set(id: newId, code: code)
+                await ContainerExitCodeStore.shared.remove(id: oldId)
+            }
         }
     }
 

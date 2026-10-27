@@ -433,6 +433,7 @@ struct ContainerInspectRouteRestartPolicyTests {
                 let inspect = try res.content.decode(RESTContainerInspect.self)
                 #expect(inspect.State.Status == "exited")
                 #expect(inspect.State.ExitCode == 7)
+                #expect(inspect.State.Dead == false, "Docker reports Dead only for a container whose removal failed")
             }
         }
         await ContainerExitCodeStore.shared.remove(id: nativeId)
@@ -611,5 +612,77 @@ struct ContainerInspectRoutePortBindingsTests {
     func portBindingsNilWhenNothingPublished() async throws {
         let inspect = try await inspect(makeSnapshot(nativeId: "inspect-no-ports-ctr", ports: []))
         #expect(inspect.HostConfig.PortBindings == nil)
+    }
+}
+
+@Suite("ContainerInspectRoute — Config.Entrypoint and Config.Cmd")
+struct ContainerInspectRouteCommandTests {
+
+    private func makeSnapshot(nativeId: String, executable: String, arguments: [String], labels: [String: String] = [:]) -> ContainerSnapshot {
+        let proc = ProcessConfiguration(
+            executable: executable, arguments: arguments, environment: [], workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0))
+        let img = ImageDescription(
+            reference: "alpine:latest", descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0))
+        var containerConfig = ContainerConfiguration(id: nativeId, image: img, process: proc)
+        containerConfig.labels = labels
+        return ContainerSnapshot(configuration: containerConfig, status: .stopped, networks: [])
+    }
+
+    private func inspect(_ snapshot: ContainerSnapshot) async throws -> RESTContainerInspect {
+        var result: RESTContainerInspect?
+        try await withApp(configure: { _ in }) { app in
+            let regexRouter = app.regexRouter(with: app.logger)
+            app.setRegexRouter(regexRouter)
+            regexRouter.installMiddleware(on: app)
+            try app.register(collection: ContainerInspectRoute(client: InspectMock(snapshot: snapshot)))
+
+            try await app.testing().test(.GET, "/v1.51/containers/\(snapshot.id)/json") { res async throws in
+                result = try res.content.decode(RESTContainerInspect.self)
+            }
+        }
+        return try #require(result)
+    }
+
+    private func label(entrypoint: [String], cmd: [String]) throws -> [String: String] {
+        let value = try #require(ContainerCreateRoute.commandLabelValue(entrypoint: entrypoint, cmd: cmd, logger: Logger(label: "test")))
+        return [ContainerCreateRoute.commandLabel: value]
+    }
+
+    @Test("`run alpine sleep 300` reports no entrypoint and the whole command as Cmd, Path/Args the process")
+    func cmdOnlyKeepsTheSplit() async throws {
+        let snapshot = makeSnapshot(
+            nativeId: "inspect-cmd-only-ctr", executable: "sleep", arguments: ["300"], labels: try label(entrypoint: [], cmd: ["sleep", "300"]))
+        let inspect = try await inspect(snapshot)
+        #expect(inspect.Config.Entrypoint == nil)
+        #expect(inspect.Config.Cmd == ["sleep", "300"])
+        #expect(inspect.Path == "sleep")
+        #expect(inspect.Args == ["300"])
+    }
+
+    @Test("An entrypoint with a command reports both as requested")
+    func entrypointAndCmd() async throws {
+        let snapshot = makeSnapshot(
+            nativeId: "inspect-ep-cmd-ctr", executable: "sh", arguments: ["-c", "sleep 300"],
+            labels: try label(entrypoint: ["sh"], cmd: ["-c", "sleep 300"]))
+        let inspect = try await inspect(snapshot)
+        #expect(inspect.Config.Entrypoint == ["sh"])
+        #expect(inspect.Config.Cmd == ["-c", "sleep 300"])
+    }
+
+    @Test("A multi-word entrypoint with no command reports Cmd unset")
+    func entrypointOnly() async throws {
+        let snapshot = makeSnapshot(
+            nativeId: "inspect-ep-only-ctr", executable: "/docker-entrypoint.sh", arguments: ["--flag"],
+            labels: try label(entrypoint: ["/docker-entrypoint.sh", "--flag"], cmd: []))
+        let inspect = try await inspect(snapshot)
+        #expect(inspect.Config.Entrypoint == ["/docker-entrypoint.sh", "--flag"])
+        #expect(inspect.Config.Cmd == nil)
+    }
+
+    @Test("A container created without the label reports the executable as the entrypoint")
+    func fallsBackToTheProcess() async throws {
+        let inspect = try await inspect(makeSnapshot(nativeId: "inspect-cmd-fallback-ctr", executable: "sleep", arguments: ["300"]))
+        #expect(inspect.Config.Entrypoint == ["sleep"])
+        #expect(inspect.Config.Cmd == ["300"])
     }
 }

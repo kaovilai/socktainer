@@ -288,8 +288,10 @@ enum LibpodSchema {
     }
 
     /// podman's `define.ContainerStats` from one Docker stats sample. CPU is computed as Docker does
-    /// (container CPU delta over system CPU delta, scaled by the online CPUs).
-    static func containerStats(_ docker: [String: Any], containerID: String) -> [String: Any] {
+    /// (container CPU delta over system CPU delta, scaled by the online CPUs). As in podman,
+    /// `UpTime` and `Duration` are the container's cumulative CPU time (podman's "CPU TIME"
+    /// column), and `AvgCPU` is that time over the wall time since `startedAt`.
+    static func containerStats(_ docker: [String: Any], containerID: String, startedAt: Date? = nil, now: Date = Date()) -> [String: Any] {
         let cpu = docker["cpu_stats"] as? [String: Any] ?? [:]
         let previous = docker["precpu_stats"] as? [String: Any] ?? [:]
         func total(_ stats: [String: Any]) -> Double { Double(int((stats["cpu_usage"] as? [String: Any])?["total_usage"])) }
@@ -323,12 +325,16 @@ enum LibpodSchema {
             }
         }
         let name = docker["name"] as? String ?? ""
+        let cpuNano = Int(total(cpu))
+        let running = startedAt.map { now.timeIntervalSince($0) * 1e9 } ?? 0
+        let averageCPU = running > 0 ? Double(cpuNano) / running * 100 : cpuPercent
         return [
-            "AvgCPU": cpuPercent, "ContainerID": containerID, "Name": name.hasPrefix("/") ? String(name.dropFirst()) : name,
-            "CPU": cpuPercent, "CPUNano": Int(total(cpu)), "CPUSystemNano": Int(system(cpu)), "SystemNano": Int(Date().timeIntervalSince1970 * 1e9),
+            "AvgCPU": averageCPU, "ContainerID": containerID, "Name": name.hasPrefix("/") ? String(name.dropFirst()) : name,
+            "CPU": cpuPercent, "CPUNano": cpuNano, "CPUSystemNano": int((cpu["cpu_usage"] as? [String: Any])?["usage_in_kernelmode"]),
+            "SystemNano": Int(now.timeIntervalSince1970 * 1e9),
             "MemUsage": usage, "MemLimit": limit, "MemPerc": limit > 0 ? Double(usage) / Double(limit) * 100 : 0,
             "Network": network, "BlockInput": blockInput, "BlockOutput": blockOutput,
-            "PIDs": int((docker["pids_stats"] as? [String: Any])?["current"]), "UpTime": 0, "Duration": 1_000_000_000,
+            "PIDs": int((docker["pids_stats"] as? [String: Any])?["current"]), "UpTime": cpuNano, "Duration": cpuNano,
         ] as [String: Any]
     }
 
