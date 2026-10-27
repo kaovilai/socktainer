@@ -35,6 +35,11 @@ struct VolumeCreateRoute: RouteCollection {
             }
             labels[Filesystem.SyncMode.socktainerLabel] = syncValue
         }
+        do {
+            try LocalBindVolume.validate(options: driverOpts)
+        } catch {
+            throw Abort(.badRequest, reason: "\(error)")
+        }
         if isAnonymous {
             // moby marks nameless creates anonymous so that volume prune
             // (without all=true) targets only them. Also stamp Apple's own
