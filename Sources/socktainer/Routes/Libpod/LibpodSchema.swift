@@ -16,9 +16,17 @@ enum LibpodSchema {
     /// `[]ListContainer`: `Command` is an argv array and `Created` an RFC3339 time (Docker sends a
     /// joined string and a Unix integer), ports use libpod's own field names, and mounts are just
     /// destination paths.
-    static func containerList(_ docker: Any?, startedAt: [String: Double] = [:]) -> Any {
+    /// `podNames` maps pod IDs to names, for the `Pod`/`PodName` of pod members.
+    static func containerList(_ docker: Any?, startedAt: [String: Double] = [:], podNames: [String: String] = [:]) -> Any {
         let items = docker as? [[String: Any]] ?? []
-        return items.map { containerSummary($0, startedAt: startedAt[$0["Id"] as? String ?? ""]) }
+        return items.map { item -> [String: Any] in
+            var summary = containerSummary(item, startedAt: startedAt[item["Id"] as? String ?? ""])
+            if let pod = (item["Labels"] as? [String: Any])?[LibpodPodSchema.podLabel] as? String {
+                summary["Pod"] = pod
+                summary["PodName"] = podNames[pod] ?? ""
+            }
+            return summary
+        }
     }
 
     /// `startedAt` is the container's start time (Unix seconds) when known: Docker's summary only
@@ -85,6 +93,9 @@ enum LibpodSchema {
             inspect["State"] = state
         }
         if let image = inspect["Image"] as? String { inspect["ImageName"] = image }
+        if let pod = ((inspect["Config"] as? [String: Any])?["Labels"] as? [String: Any])?[LibpodPodSchema.podLabel] as? String {
+            inspect["Pod"] = pod
+        }
         return inspect
     }
 
