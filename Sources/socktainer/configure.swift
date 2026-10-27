@@ -210,6 +210,7 @@ func configure(_ app: Application) async throws {
         try app.register(collection: LibpodImageDeleteRoute(client: imageClient))
         try app.register(collection: LibpodImageInspectRoute(systemConfig: systemConfig))
         try app.register(collection: LibpodImageTagRoute(systemConfig: systemConfig))
+        try app.register(collection: LibpodImageUntagRoute(systemConfig: systemConfig))
         try app.register(collection: LibpodBuildRoute(client: containerClient, builderClient: builderClient, systemConfig: systemConfig, manifestClient: manifestClient))
         try app.register(collection: LibpodContainerLogsRoute(client: containerClient))
         try app.register(collection: LibpodContainerTopRoute(client: containerClient, runner: commandRunner))
