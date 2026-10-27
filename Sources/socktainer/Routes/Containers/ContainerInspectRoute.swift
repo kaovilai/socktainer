@@ -143,6 +143,7 @@ extension ContainerInspectRoute {
                 Shell: nil  // no mechanism to derive this value
             )
 
+            let bindVolumeNames = LocalBindVolume.volumeNames(labels: container.configuration.labels)
             let mounts = container.configuration.mounts.map { mount in
                 let mountType: String
                 let mountName: String?
@@ -155,8 +156,10 @@ extension ContainerInspectRoute {
                     mountType = "volume"
                     mountName = name
                 case .virtiofs:
-                    mountType = "bind"
-                    mountName = nil
+                    // A bind-backed named volume is shared over virtiofs but is still a volume.
+                    let volumeName = bindVolumeNames[mount.destination]
+                    mountType = volumeName == nil ? "bind" : "volume"
+                    mountName = volumeName
                 case .tmpfs:
                     mountType = "tmpfs"
                     mountName = nil
