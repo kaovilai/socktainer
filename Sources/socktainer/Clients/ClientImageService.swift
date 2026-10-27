@@ -19,6 +19,24 @@ struct ImageDeletionResult {
     let deletedDigest: String?  // sha256 if the image layers were garbage-collected
 }
 
+/// `docker commit` support, kept apart from `ClientImageProtocol` so the many image
+/// mocks need not implement it.
+protocol ClientImageCommitProtocol: Sendable {
+    func commitImage(
+        tarPath: URL,
+        repo: String?,
+        tag: String?,
+        comment: String?,
+        author: String?,
+        configJSON: Data,
+        platform: Platform,
+        appleContainerAppSupportUrl: URL,
+        logger: Logger
+    ) async throws -> (reference: String?, digest: String)
+
+    func rawImageConfig(reference: String, platform: Platform, appleContainerAppSupportUrl: URL) async throws -> Data
+}
+
 protocol ClientImageProtocol: Sendable {
     func list(includeSystemImages: Bool) async throws -> [ClientImage]
     func delete(id: String) async throws -> ImageDeletionResult
@@ -151,7 +169,7 @@ struct LiveImageDeletionStore: ImageDeletionStore {
     }
 }
 
-struct ClientImageService: ClientImageProtocol {
+struct ClientImageService: ClientImageProtocol, ClientImageCommitProtocol {
     private let containerSystemConfig: ContainerSystemConfig
 
     init(containerSystemConfig: ContainerSystemConfig) {
@@ -749,22 +767,20 @@ struct ClientImageService: ClientImageProtocol {
         let exportPath = tempDir.appendingPathComponent("oci-layout")
         try FileManager.default.createDirectory(at: exportPath, withIntermediateDirectories: true)
 
+        // Not `imageStore.save`: it exports every platform the index lists and fails on
+        // the first blob a single-platform pull never fetched ("content with digest ...
+        // not found"). See `OCILayoutPruner.exportComplete`.
         do {
-            try await imageStore.save(
+            try await Self.writeOCILayout(
                 references: resolvedReferences,
-                out: exportPath,
-                platform: platform
+                imageStore: imageStore,
+                contentRoot: appleContainerAppSupportUrl.appendingPathComponent("content"),
+                to: exportPath,
+                platform: platform,
+                logger: logger
             )
         } catch {
-            let errorDescription = String(describing: error)
-            logger.error("Failed to export images: \(errorDescription)")
-
-            if errorDescription.contains("notFound") && errorDescription.localizedCaseInsensitiveContains("content with digest") {
-                let detailedMessage =
-                    "Export failed: ContentStore missing blob data. This is a limitation of Apple's Containerization framework. The image metadata exists but the underlying content blobs are not available."
-                logger.error("\(detailedMessage)")
-                throw ClientImageError.notFound(id: detailedMessage)
-            }
+            try? FileManager.default.removeItem(at: tempDir)
             throw error
         }
 
@@ -775,6 +791,7 @@ struct ClientImageService: ClientImageProtocol {
             ociLayoutPath: exportPath,
             dockerFormatPath: dockerFormatPath,
             resolvedRefs: resolvedReferences,
+            preferredPlatform: platform ?? .current,
             logger: logger
         )
 
@@ -788,6 +805,99 @@ struct ClientImageService: ClientImageProtocol {
         logger.info("Successfully exported \(resolvedReferences.count) image(s) to tarball in Docker format")
 
         return tarballPath
+    }
+
+    /// Writes an OCI image layout holding `references`, each limited to the manifests whose
+    /// content is fully present in the store (and matching `platform` when given).
+    static func writeOCILayout(
+        references: [String],
+        imageStore: ImageStore,
+        contentRoot: URL,
+        to out: URL,
+        platform: Platform?,
+        logger: Logger
+    ) async throws {
+        var saved: [Descriptor] = []
+        for reference in references {
+            let image = try await imageStore.get(reference: reference)
+            guard
+                var descriptor = try OCILayoutPruner.exportComplete(
+                    image.descriptor, from: contentRoot, to: out, platform: platform, logger: logger)
+            else {
+                let scope = platform.map { " for platform \($0.description)" } ?? ""
+                throw ClientImageError.notFound(id: "\(reference) has no locally available content\(scope)")
+            }
+            var annotations = descriptor.annotations ?? [:]
+            annotations[AnnotationKeys.containerizationImageName] = reference
+            annotations[AnnotationKeys.containerdImageName] = reference
+            annotations[AnnotationKeys.openContainersImageName] = reference
+            descriptor.annotations = annotations
+            saved.append(descriptor)
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        try encoder.encode(["imageLayoutVersion": "1.0.0"]).write(to: out.appendingPathComponent("oci-layout"))
+        try encoder.encode(Index(schemaVersion: 2, manifests: saved)).write(to: out.appendingPathComponent("index.json"))
+    }
+
+    /// `docker commit`: same as `importImage`, but the config is the commit's composed
+    /// config object (`CommitConfigComposer`) rather than one built from `changes`.
+    func commitImage(
+        tarPath: URL,
+        repo: String?,
+        tag: String?,
+        comment: String?,
+        author: String?,
+        configJSON: Data,
+        platform: Platform,
+        appleContainerAppSupportUrl: URL,
+        logger: Logger
+    ) async throws -> (reference: String?, digest: String) {
+        let reference = try resolveImportReference(repo: repo, tag: tag)
+        guard let configDict = try JSONSerialization.jsonObject(with: configJSON) as? [String: Any] else {
+            throw ClientImageError.notFound(id: "commit config is not a JSON object")
+        }
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let ociLayoutPath = tempDir.appendingPathComponent("oci-layout")
+        try FileManager.default.createDirectory(at: ociLayoutPath, withIntermediateDirectories: true)
+
+        _ = try ContainerImageUtility.buildSingleLayerOCILayout(
+            tarPath: tarPath,
+            ociLayoutPath: ociLayoutPath,
+            platform: platform,
+            configDict: configDict,
+            message: comment,
+            author: author,
+            reference: reference,
+            logger: logger
+        )
+
+        let imageStore = try ImageStore(path: appleContainerAppSupportUrl)
+        let images = try await imageStore.load(from: ociLayoutPath, progress: nil)
+        guard let image = images.first else {
+            throw ClientImageError.notFound(id: reference ?? "committed image")
+        }
+
+        logger.info("Committed image \(image.reference) (\(image.digest))")
+        return (reference, image.digest)
+    }
+
+    /// The raw config blob of `reference`'s manifest for `platform` — `docker commit`
+    /// starts from it, since Apple's typed `ImageConfig` drops fields such as
+    /// ExposedPorts and Volumes.
+    func rawImageConfig(reference: String, platform: Platform, appleContainerAppSupportUrl: URL) async throws -> Data {
+        let image = try await ClientImage.get(reference: reference, containerSystemConfig: containerSystemConfig)
+        let manifest = try await image.manifest(for: platform)
+        let content = try LocalContentStore(path: appleContainerAppSupportUrl.appendingPathComponent("content"))
+        guard let blob = try await content.get(digest: manifest.config.digest) else {
+            throw ClientImageError.notFound(id: manifest.config.digest)
+        }
+        return try blob.data()
     }
 
     /// `docker import`: synthesizes a single-layer OCI image from `tarPath` (the

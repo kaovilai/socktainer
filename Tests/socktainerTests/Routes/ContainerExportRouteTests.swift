@@ -155,7 +155,7 @@ private actor FakeArchiveClient: ClientArchiveProtocol {
         throw ClientArchiveError.operationFailed(message: "not under test")
     }
 
-    func exportRootfs(containerId: String) async throws -> URL {
+    func exportRootfs(container: ContainerSnapshot) async throws -> URL {
         switch exportResult {
         case .failure(let error):
             throw error

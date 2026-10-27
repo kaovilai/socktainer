@@ -43,6 +43,7 @@ struct MockManifestClient: ClientManifestServiceProtocol {
     var deleteHandler: (@Sendable (String) async throws -> Void)?
     var retagForPushHandler: (@Sendable (String, String) async throws -> (reference: String, priorState: RetagState?))?
     var untagPushDestinationHandler: (@Sendable (RetagState) async throws -> Void)?
+    var annotateHandler: (@Sendable (String, String, ManifestAnnotation) async throws -> String)?
 
     func exists(name: String) async throws -> Bool {
         await recorder?.record("exists(\(name))")
@@ -96,6 +97,12 @@ struct MockManifestClient: ClientManifestServiceProtocol {
         await recorder?.record("addBuiltImage(\(name), \(builtReference))")
         guard let addBuiltImageHandler else { throw Unconfigured(method: "addBuiltImage") }
         return try await addBuiltImageHandler(name, builtReference)
+    }
+
+    func annotate(name: String, instance: String, annotation: ManifestAnnotation, logger: Logger) async throws -> String {
+        await recorder?.record("annotate(\(name), \(instance))")
+        guard let annotateHandler else { throw Unconfigured(method: "annotate") }
+        return try await annotateHandler(name, instance, annotation)
     }
 
     func delete(name: String) async throws {

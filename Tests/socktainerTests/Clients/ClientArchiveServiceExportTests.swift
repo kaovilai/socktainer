@@ -1,3 +1,5 @@
+import ContainerAPIClient
+import ContainerResource
 import ContainerizationArchive
 import ContainerizationEXT4
 import Foundation
@@ -17,7 +19,7 @@ struct ClientArchiveServiceExportTests {
             containerId: "web",
             files: ["/hello.txt": "exported by socktainer\n", "/etc/hostname": "web\n"])
 
-        let tarURL = try await fixture.service.exportRootfs(containerId: "web")
+        let tarURL = try await fixture.service.exportRootfs(container: makeContainerSnapshot(nativeId: "web", networks: [], labels: [:]))
         defer { try? FileManager.default.removeItem(at: tarURL) }
 
         let extracted = fixture.appSupport.appendingPathComponent("extracted")
@@ -34,7 +36,7 @@ struct ClientArchiveServiceExportTests {
         defer { fixture.cleanUp() }
 
         do {
-            _ = try await fixture.service.exportRootfs(containerId: "ghost")
+            _ = try await fixture.service.exportRootfs(container: makeContainerSnapshot(nativeId: "ghost", networks: [], labels: [:]))
             Issue.record("export of a container with no rootfs must throw")
         } catch let error as ClientArchiveError {
             guard case .rootfsNotFound(let id) = error else {
@@ -52,7 +54,7 @@ struct ClientArchiveServiceExportTests {
         try fixture.writeRawRootfs(containerId: "broken", bytes: Data("not an ext4 filesystem".utf8))
 
         do {
-            _ = try await fixture.service.exportRootfs(containerId: "broken")
+            _ = try await fixture.service.exportRootfs(container: makeContainerSnapshot(nativeId: "broken", networks: [], labels: [:]))
             Issue.record("export of a corrupt rootfs must throw")
         } catch let error as ClientArchiveError {
             guard case .operationFailed(let message) = error else {
@@ -62,15 +64,40 @@ struct ClientArchiveServiceExportTests {
             #expect(message.contains("broken"))
         }
     }
+
+    @Test("a running container's guest is flushed before its rootfs is read")
+    func runningContainerFlushesFirst() async throws {
+        let appSupport = FileManager.default.temporaryDirectory.appendingPathComponent("export-test-\(UUID().uuidString)")
+        // The flush stands in for the guest writing back its page cache: the file only
+        // reaches rootfs.ext4 when the flush runs, so the tar carries it only if the
+        // export flushed before reading.
+        let fixture = ExportFixture(appSupport: appSupport) { container in
+            try ExportFixture(appSupport: appSupport).writeExt4Rootfs(
+                containerId: container.id, files: ["/committed.txt": "written just before export\n"])
+        }
+        defer { fixture.cleanUp() }
+        try fixture.writeExt4Rootfs(containerId: "live", files: ["/old.txt": "old\n"])
+
+        let tarURL = try await fixture.service.exportRootfs(
+            container: makeContainerSnapshot(nativeId: "live", networks: [], labels: [:], status: .running))
+        defer { try? FileManager.default.removeItem(at: tarURL) }
+
+        let extracted = appSupport.appendingPathComponent("extracted")
+        try ArchiveUtility.extract(tarPath: tarURL, to: extracted)
+        #expect(firstFile(named: "committed.txt", under: extracted) != nil)
+    }
 }
 
 private struct ExportFixture {
     let appSupport: URL
     let service: ClientArchiveService
 
-    init() {
-        appSupport = FileManager.default.temporaryDirectory.appendingPathComponent("export-test-\(UUID().uuidString)")
-        service = ClientArchiveService(appSupportPath: appSupport)
+    init(
+        appSupport: URL = FileManager.default.temporaryDirectory.appendingPathComponent("export-test-\(UUID().uuidString)"),
+        flushGuest: @escaping @Sendable (ContainerSnapshot) async throws -> Void = { _ in }
+    ) {
+        self.appSupport = appSupport
+        service = ClientArchiveService(appSupportPath: appSupport, flushGuest: flushGuest)
     }
 
     func cleanUp() {

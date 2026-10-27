@@ -3,8 +3,8 @@ import Vapor
 
 /// `PUT /libpod/manifests/{name}` — real podman's unified add/remove/annotate endpoint
 /// (`ManifestModifyOptions{Operation: "update"|"remove"|"annotate", Images: [...]}`).
-/// "annotate" (setting index-level annotations only, no image changes) isn't implemented —
-/// real-world use is overwhelmingly add/remove.
+/// "annotate" sets a member's platform/annotations, or the index's own annotations
+/// (`--index`); see `ManifestAnnotation`.
 ///
 /// Real podman (`pkg/bindings/manifests`'s `Modify`) sends `operation`/`images`/etc. as
 /// query parameters (`images` repeated once per image, like `platform` on `/build` — see
@@ -75,7 +75,16 @@ struct LibpodManifestModifyRoute: RouteCollection {
                     let result = try await client.removeDigests(name: name, digests: normalizedDigests)
                     return RESTManifestIDResponse(ID: result)
                 case "annotate":
-                    throw Abort(.notImplemented, reason: "manifest annotate is not implemented")
+                    // The platform/annotation fields only travel in the JSON body.
+                    let body = req.body.data.map { Data(buffer: $0) } ?? Data()
+                    let (annotation, bodyImages) = try ManifestAnnotation.decode(podmanBody: body)
+                    // podman sends `[""]` for `--index`; an empty list means the same.
+                    let instances = images.isEmpty ? (bodyImages.isEmpty ? [""] : bodyImages) : images
+                    var result = ""
+                    for instance in instances {
+                        result = try await client.annotate(name: name, instance: instance, annotation: annotation, logger: req.logger)
+                    }
+                    return RESTManifestIDResponse(ID: result)
                 case "update", nil, "":
                     guard !images.isEmpty else {
                         throw Abort(.badRequest, reason: "update requires at least one image")

@@ -144,8 +144,8 @@ protocol ClientArchiveProtocol: Sendable {
     func putArchive(container: ContainerSnapshot, path: String, tarPath: URL, noOverwriteDirNonDir: Bool) async throws
 
     /// Export the container's entire root filesystem as an uncompressed tar
-    /// (docker export). The caller owns the returned file and deletes it when done.
-    func exportRootfs(containerId: String) async throws -> URL
+    /// (docker export, docker commit). The caller owns the returned file and deletes it when done.
+    func exportRootfs(container: ContainerSnapshot) async throws -> URL
 }
 
 /// Service for performing archive operations on container filesystems
@@ -483,8 +483,14 @@ struct ClientArchiveService: ClientArchiveProtocol {
     /// snapshot — the same guarantee moby gives when exporting a running
     /// container's mounted layer. The export runs detached because it is
     /// synchronous I/O that can take minutes for large filesystems.
-    func exportRootfs(containerId: String) async throws -> URL {
-        let rootfsPath = getRootfsPath(containerId: containerId)
+    ///
+    /// A running guest's recent writes are flushed first (as `docker cp` does), so a
+    /// file written just before `docker export`/`docker commit` is in the tar; a
+    /// never-started container exports its image snapshot.
+    func exportRootfs(container: ContainerSnapshot) async throws -> URL {
+        let containerId = container.id
+        await flushIfRunning(container)
+        let rootfsPath = try resolveRootfsPath(container: container)
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
             throw ClientArchiveError.rootfsNotFound(id: containerId)
         }
@@ -1275,5 +1281,60 @@ final class GuestFlushBreaker: @unchecked Sendable {
             trips[id] = trip
             return true
         }
+    }
+}
+
+/// `docker diff` / `podman diff`, kept apart from `ClientArchiveProtocol` so its mocks
+/// need not implement it.
+protocol ClientContainerChangesProtocol: Sendable {
+    func changes(container: ContainerSnapshot) async throws -> [RootfsDiff.Change]
+}
+
+extension ClientArchiveService: ClientContainerChangesProtocol {
+    /// Diffs the container's private `rootfs.ext4` against the image snapshot it was
+    /// cloned from (see `RootfsDiff`). A never-started container has no clone yet and so
+    /// no changes; a running one is flushed first so recent writes are seen.
+    func changes(container: ContainerSnapshot) async throws -> [RootfsDiff.Change] {
+        let rootfsPath = getRootfsPath(containerId: container.id)
+        guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
+            guard container.startedDate == nil else {
+                throw ClientArchiveError.rootfsNotFound(id: container.id)
+            }
+            return []
+        }
+        guard let snapshotPath = imageSnapshotPath(containerId: container.id) else {
+            throw ClientArchiveError.operationFailed(message: "the image snapshot \(container.id) was created from is no longer available")
+        }
+        await flushIfRunning(container)
+
+        let containerDevice = rootfsPath.path
+        do {
+            return try await Task.detached(priority: .utility) {
+                let base = try EXT4.EXT4Reader(blockDevice: FilePath(snapshotPath.path))
+                let current = try EXT4.EXT4Reader(blockDevice: FilePath(containerDevice))
+                return try RootfsDiff.changes(base: base, container: current)
+            }.value
+        } catch {
+            throw ClientArchiveError.operationFailed(message: "failed to compare the filesystem of \(container.id) with its image: \(error)")
+        }
+    }
+
+    /// The image snapshot a container's rootfs was cloned from, as recorded in its
+    /// `runtime-configuration.json` (which keeps pointing at it after the clone).
+    private func imageSnapshotPath(containerId: String) -> URL? {
+        let configURL =
+            appSupportPath
+            .appendingPathComponent("containers")
+            .appendingPathComponent(containerId)
+            .appendingPathComponent("runtime-configuration.json")
+        guard
+            let data = try? Data(contentsOf: configURL),
+            let config = try? JSONDecoder().decode(RuntimeConfiguration.self, from: data),
+            !config.containerRootFilesystem.source.isEmpty,
+            FileManager.default.fileExists(atPath: config.containerRootFilesystem.source)
+        else {
+            return nil
+        }
+        return URL(fileURLWithPath: config.containerRootFilesystem.source)
     }
 }
