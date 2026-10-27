@@ -64,13 +64,13 @@ struct InfoRoute: RouteCollection {
             let systemConfig = try await loadSystemConfig(using: configLoader, logger: req.logger)
 
             let health = try await systemHealthProvider()
+            let counts = containerCounts(allContainers)
 
             let info = SystemInfo(
                 Containers: allContainers.count,
-                ContainersRunning: allContainers.filter { $0.status == RuntimeStatus.running }.count,
-                // Apple container doesn't support pausing containers
-                ContainersPaused: 0,
-                ContainersStopped: allContainers.filter { $0.status == RuntimeStatus.stopped }.count,
+                ContainersRunning: counts.running,
+                ContainersPaused: counts.paused,
+                ContainersStopped: counts.stopped,
                 Images: try await imageClient.list().count,
                 DockerRootDir: health.dockerRootDir,
                 Debug: isDebug(),
@@ -104,6 +104,17 @@ struct InfoRoute: RouteCollection {
             response.body = .init(string: "{\"message\": \"Failed to generate system information\"}\n")
             return response
         }
+    }
+
+    /// Docker's running/paused/stopped split: a paused container still runs as far as Apple
+    /// Container is concerned, but Docker counts it as paused and not as running.
+    static func containerCounts(
+        _ containers: [ContainerSnapshot], pauseState: ContainerPauseState = .shared
+    ) -> (running: Int, paused: Int, stopped: Int) {
+        let paused = containers.filter { pauseState.isPaused($0) }.count
+        let running = containers.filter { $0.status == .running }.count - paused
+        let stopped = containers.filter { $0.status == .stopped }.count
+        return (running, paused, stopped)
     }
 
     /// Loads the system config, falling back to defaults when `config.toml` is missing or malformed.

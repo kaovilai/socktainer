@@ -53,11 +53,41 @@ struct LibpodContainerWaitRouteTests {
         #expect(await client.receivedCondition == .removed)
     }
 
-    @Test("condition=paused (no pause on Apple Container) is 501, not a misleading 400 'invalid condition'")
-    func pausedConditionIsNotImplemented() async throws {
-        let client = RecordingWaitClient()
+    @Test("condition=paused answers -1 once the container is paused")
+    func pausedConditionAnswersMinusOne() async throws {
+        // Pause state is process-wide: a distinct ID keeps parallel tests from clearing this entry.
+        let snapshot = makeSnapshot(status: .running, id: "wait-paused-condition")
+        ContainerPauseState.shared.markPaused(snapshot)
+        defer { ContainerPauseState.shared.markUnpaused(id: snapshot.id) }
+        let client = RecordingWaitClient(snapshot: snapshot)
         try await withWaitRoute(client) { app in
             try await app.testing().test(.POST, "/v1.51/libpod/containers/ctr/wait?condition=paused") { res async throws in
+                #expect(res.status == .ok)
+                #expect(String(buffer: res.body).trimmingCharacters(in: .whitespacesAndNewlines) == "-1")
+            }
+        }
+        #expect(await client.receivedCondition == nil)
+    }
+
+    @Test("condition=running does not hold for a paused container: podman reports it as paused")
+    func runningConditionIgnoresPausedContainer() async throws {
+        let snapshot = makeSnapshot(status: .running, id: "wait-running-while-paused")
+        ContainerPauseState.shared.markPaused(snapshot)
+        defer { ContainerPauseState.shared.markUnpaused(id: snapshot.id) }
+        let client = RecordingWaitClient(snapshot: snapshot)
+        try await withApp(configure: { _ in }) { app in
+            let probe = Task { await LibpodContainerWaitRoute.stateReached([.running], nativeId: snapshot.id, client: client, app: app) }
+            try await Task.sleep(nanoseconds: 2 * LibpodContainerWaitRoute.statePollIntervalNs)
+            probe.cancel()
+            #expect(await probe.value == nil)
+        }
+    }
+
+    @Test("condition=stopping is still 501, not a misleading 400 'invalid condition'")
+    func stoppingConditionIsNotImplemented() async throws {
+        let client = RecordingWaitClient()
+        try await withWaitRoute(client) { app in
+            try await app.testing().test(.POST, "/v1.51/libpod/containers/ctr/wait?condition=stopping") { res async throws in
                 #expect(res.status == .notImplemented)
             }
         }
@@ -158,13 +188,13 @@ private actor RecordingWaitClient: ClientContainerProtocol {
 
 /// The Docker-compat wait handler (which this route delegates to) 404s on a container that doesn't exist.
 /// A stopped snapshot has no start date, so it is a container that never started.
-private func makeSnapshot(status: RuntimeStatus) -> ContainerSnapshot {
+private func makeSnapshot(status: RuntimeStatus, id: String = "ctr") -> ContainerSnapshot {
     let process = ProcessConfiguration(
         executable: "/bin/sh", arguments: [], environment: [], workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0))
     let image = ImageDescription(
         reference: "alpine:latest",
         descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0))
-    let config = ContainerConfiguration(id: "ctr", image: image, process: process)
+    let config = ContainerConfiguration(id: id, image: image, process: process)
     return ContainerSnapshot(
         configuration: config, status: status, networks: [], startedDate: status == .running ? Date(timeIntervalSinceNow: -5) : nil)
 }
