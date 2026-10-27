@@ -469,6 +469,12 @@ extension ContainerCreateRoute {
                 containerLabels[ContainerCreateRoute.portBindingsLabel] = portBindingsLabel
             }
 
+            // Apple Container keeps only the resolved process (executable + arguments); persist
+            // the Entrypoint/Cmd split so inspect can report Config.Entrypoint and Config.Cmd.
+            if let commandLabel = ContainerCreateRoute.commandLabelValue(entrypoint: entrypoint, cmd: command, logger: req.logger) {
+                containerLabels[ContainerCreateRoute.commandLabel] = commandLabel
+            }
+
             if !dnsNames.isEmpty {
                 containerLabels["socktainer.dns.names"] = dnsNames.joined(separator: ",")
             }
@@ -1036,6 +1042,25 @@ extension ContainerCreateRoute {
             return String(data: try encoder.encode(bindings), encoding: .utf8)
         } catch {
             logger.warning("Failed to encode port bindings: \(error) — inspect will report the bound ports instead")
+            return nil
+        }
+    }
+
+    static let commandLabel = "socktainer.command"
+
+    /// The effective Entrypoint and Cmd (request merged over the image's), as Docker reports them
+    /// in `Config.Entrypoint` / `Config.Cmd`: an empty one is unset.
+    struct PersistedCommand: Codable, Equatable {
+        let Entrypoint: [String]?
+        let Cmd: [String]?
+    }
+
+    static func commandLabelValue(entrypoint: [String], cmd: [String], logger: Logger) -> String? {
+        let persisted = PersistedCommand(Entrypoint: entrypoint.isEmpty ? nil : entrypoint, Cmd: cmd.isEmpty ? nil : cmd)
+        do {
+            return String(data: try JSONEncoder().encode(persisted), encoding: .utf8)
+        } catch {
+            logger.warning("Failed to encode command: \(error) — inspect will report the process split instead")
             return nil
         }
     }
