@@ -95,15 +95,102 @@ extension DockerEvent {
     }
 }
 
+/// Fixed-capacity FIFO of the most recent events (moby keeps the last 256 in
+/// `daemon/events.Events.events`). Appending past capacity drops the oldest entry.
+struct EventHistory: Sendable {
+    let capacity: Int
+    private var storage: [DockerEvent] = []
+    private var head = 0  // index of the oldest element once storage is full
+
+    init(capacity: Int) {
+        self.capacity = max(0, capacity)
+        storage.reserveCapacity(self.capacity)
+    }
+
+    mutating func append(_ event: DockerEvent) {
+        guard capacity > 0 else { return }
+        if storage.count < capacity {
+            storage.append(event)
+        } else {
+            storage[head] = event
+            head = (head + 1) % capacity
+        }
+    }
+
+    /// Buffered events, oldest first.
+    var events: [DockerEvent] {
+        Array(storage[head...] + storage[..<head])
+    }
+
+    var count: Int { storage.count }
+}
+
+/// A live subscription plus the buffered events that were already broadcast when it
+/// was registered. Both are captured in a single actor turn, so every event lands in
+/// exactly one of them — no gap and no duplicate between replay and live delivery.
+struct EventSubscription: Sendable {
+    let id: UUID
+    let history: [DockerEvent]
+    let stream: AsyncStream<DockerEvent>
+}
+
 actor EventBroadcaster {
+    /// Default number of past events kept for `since`/`until` replay.
+    /// Override with `SOCKTAINER_EVENTS_HISTORY` (0 disables replay).
+    static let defaultHistoryLimit = 1000
+
+    static func configuredHistoryLimit(environment: [String: String] = ProcessInfo.processInfo.environment) -> Int {
+        guard let raw = environment["SOCKTAINER_EVENTS_HISTORY"], let value = Int(raw), value >= 0 else {
+            return defaultHistoryLimit
+        }
+        return value
+    }
+
     private var continuations: [UUID: AsyncStream<DockerEvent>.Continuation] = [:]
     /// When each (actor id, action) of container and image events was last broadcast, so `ExternalEventWatcher`
     /// can skip transitions socktainer's own routes already reported.
-    private var recentEvents: [String: Date] = [:]
+    private var lastEmitted: [String: Date] = [:]
+    private var history: EventHistory
+
+    init(historyLimit: Int = EventBroadcaster.configuredHistoryLimit()) {
+        history = EventHistory(capacity: historyLimit)
+    }
 
     func stream() -> AsyncStream<DockerEvent> {
-        let id = UUID()
+        register(id: UUID())
+    }
 
+    /// Registers a live listener and snapshots the history buffer in the same actor
+    /// turn (see `EventSubscription`).
+    func subscribe() -> EventSubscription {
+        let id = UUID()
+        let stream = register(id: id)
+        return EventSubscription(id: id, history: history.events, stream: stream)
+    }
+
+    /// Ends a subscription's stream (e.g. when its `until` deadline passes).
+    func finish(id: UUID) {
+        continuations.removeValue(forKey: id)?.finish()
+    }
+
+    /// Buffered events, oldest first.
+    func recentEvents() -> [DockerEvent] {
+        history.events
+    }
+
+    func broadcast(_ event: DockerEvent) {
+        history.append(event)
+        if event.Type == "container" || event.Type == "image" {
+            let now = Date()
+            lastEmitted = lastEmitted.filter { now.timeIntervalSince($0.value) < 60 }
+            lastEmitted["\(event.Actor.ID)/\(event.Action)"] = now
+        }
+        for continuation in continuations.values {
+            continuation.yield(event)
+        }
+    }
+
+    private func register(id: UUID) -> AsyncStream<DockerEvent> {
         // Register the continuation synchronously, before returning the stream. The
         // previous implementation deferred registration to `Task { addContinuation }`,
         // leaving a window where the stream existed but was not yet in `continuations`
@@ -118,22 +205,11 @@ actor EventBroadcaster {
         return stream
     }
 
-    func broadcast(_ event: DockerEvent) {
-        if event.Type == "container" || event.Type == "image" {
-            let now = Date()
-            recentEvents = recentEvents.filter { now.timeIntervalSince($0.value) < 60 }
-            recentEvents["\(event.Actor.ID)/\(event.Action)"] = now
-        }
-        for continuation in continuations.values {
-            continuation.yield(event)
-        }
-    }
-
     /// Open `stream()` subscriptions; one drops once its stream is released.
     var subscriberCount: Int { continuations.count }
 
     func emittedRecently(id: String, action: String, within interval: TimeInterval) -> Bool {
-        guard let last = recentEvents["\(id)/\(action)"] else { return false }
+        guard let last = lastEmitted["\(id)/\(action)"] else { return false }
         return Date().timeIntervalSince(last) < interval
     }
 
