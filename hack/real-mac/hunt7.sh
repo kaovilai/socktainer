@@ -6,7 +6,9 @@
 # socket; PASS/FAIL lines go to ~/hunt7-results.txt (DONE marks the end).
 # XFAIL lines are informative checks for paths socktainer may not support (s390x at runtime, buildx,
 # docker push to a plain-http registry): they record the error text and are not counted as FAIL.
-# INFO lines carry versions. Checks only touch resources labelled hunt=1 or named h7*/h7/*.
+# INFO lines carry versions. Checks only touch resources named h7*/h7/* and untagged images this run
+# created. Removals never select by label: socktainer ignores `images --filter label=`, so a
+# label-filtered rmi would delete every image in the store.
 # buildx: the plugin is looked up under $H7_BUILDX_CONFIG/cli-plugins (default ~/.docker-buildx, see
 # box-setup.sh), not ~/.docker, so hunt4's `docker build` stays on the classic builder.
 export PATH=/usr/local/bin:/opt/podman/bin:$HOME/bin:$PATH
@@ -52,13 +54,20 @@ for m in outer.getmembers():
 print('NOTFOUND')
 PY
 }
-h7images() { ${=P} images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E '(^|/)h7/' | grep -v '<none>'; }
+# h7 image references (h7/* and localhost:5001/h7/*), by name only.
+h7refs() { ${=P} images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E '(^|/)h7/' | grep -v '<none>'; }
+# untagged image IDs this run created (manifest-list members, dangling build stages): IDs absent from
+# the BASEIDS snapshot taken after the first cleanup. Empty until that snapshot exists.
+h7untagged() { (( ${+BASEIDS} )) || return 0; local ref id
+  ${=P} images --format '{{.Repository}}:{{.Tag}} {{.ID}}' 2>/dev/null | while read -r ref id; do
+    [[ $ref == '<none>:<none>' && -n $id && ${BASEIDS[(Ie)$id]} -eq 0 ]] && echo $id; done; }
+h7images() { h7refs; h7untagged; }
+h7ctrs() { ${=P} ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^(h7|buildx_buildkit_h7)'; }
 cleanup() {
   env DOCKER_CONFIG=$BXCFG docker buildx rm -f h7bx >/dev/null 2>&1
-  ${=P} rm -f $(${=P} ps -aq --filter label=hunt=1 2>/dev/null) >/dev/null 2>&1
-  ${=P} rm -f buildx_buildkit_h7bx0 >/dev/null 2>&1
+  ${=P} rm -f $(h7ctrs) >/dev/null 2>&1
   ${=P} manifest rm h7/ml:1 >/dev/null 2>&1
-  ${=P} rmi -f $(h7images) $(${=P} images -q --filter label=h7ml=1 2>/dev/null) >/dev/null 2>&1; }
+  ${=P} rmi -f $(h7images) >/dev/null 2>&1; }
 
 W=$HOME/h7ctx; rm -rf $W; mkdir -p $W
 cat > $W/Dockerfile.arch <<'D'
@@ -73,6 +82,7 @@ RUN uname -m > /arch.txt
 CMD ["cat","/arch.txt"]
 D
 cleanup
+BASEIDS=( ${(f)"$(${=P} images --format '{{.ID}}' 2>/dev/null)"} )
 ${=P} pull $A >/dev/null 2>&1; ${=P} pull $R >/dev/null 2>&1
 
 section "versions"
@@ -107,12 +117,12 @@ checkrc "build arm64+amd64 --manifest" "." "setopt pipefail; cd $W && $PB build 
 check "local manifest has arm64+amd64" "arm64.*amd64|amd64.*arm64" "$P manifest inspect h7/ml:1 | tr -d ' \n'"
 checkrc "manifest push --all" "." "setopt pipefail; $PB manifest push --tls-verify=false --all h7/ml:1 docker://$REG/h7/ml:1 2>&1 | tail -2"
 check "registry index has arm64+amd64" "arm64.*amd64|amd64.*arm64" "curl -s -H 'Accept: application/vnd.oci.image.index.v1+json' -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' http://127.0.0.1:5001/v2/h7/ml/manifests/1 | tr -d ' \n'"
-check "rm local list + members" "^$" "$P manifest rm h7/ml:1 >/dev/null 2>&1; $P rmi -f \$($P images -q --filter label=h7ml=1) >/dev/null 2>&1; $P images -q --filter label=h7ml=1"
+check "rm local list + members" "^$" "$P manifest rm h7/ml:1 >/dev/null 2>&1; $P rmi -f \$(h7untagged) \$(h7refs | grep h7/ml) >/dev/null 2>&1; h7untagged; h7refs | grep h7/ml"
 checkrc "pull --platform linux/amd64 from registry" "." "setopt pipefail; $PB pull --tls-verify=false --platform linux/amd64 $REG/h7/ml:1 2>&1 | tail -1"
 check "pulled amd64 Architecture" "^amd64" "$P image inspect $REG/h7/ml:1 --format '{{.Architecture}}'"
 check "run pulled amd64: uname -m" "^x86_64" "runlog h7pa --platform linux/amd64 $REG/h7/ml:1 uname -m"
 check "run pulled amd64: build-time arch" "^x86_64" "runlog h7pa2 --platform linux/amd64 $REG/h7/ml:1"
-check "rmi pulled amd64" "^$" "$P rmi -f $REG/h7/ml:1 >/dev/null 2>&1; $P rmi -f \$($P images -q --filter label=h7ml=1) >/dev/null 2>&1; $P images -q --filter label=h7ml=1"
+check "rmi pulled amd64" "^$" "$P rmi -f $REG/h7/ml:1 >/dev/null 2>&1; h7refs | grep h7/ml"
 checkrc "pull --platform linux/arm64 from registry" "." "setopt pipefail; $PB pull --tls-verify=false --platform linux/arm64 $REG/h7/ml:1 2>&1 | tail -1"
 check "pulled arm64 Architecture" "^arm64" "$P image inspect $REG/h7/ml:1 --format '{{.Architecture}}'"
 check "run pulled arm64: uname -m" "^aarch64" "runlog h7pb $REG/h7/ml:1 uname -m"
@@ -153,6 +163,6 @@ fi
 
 section "cleanup"
 cleanup
-check "no h7 containers left" "^$" "$P ps -aq --filter label=hunt=1"
+check "no h7 containers left" "^$" "h7ctrs"
 check "no h7 images left" "^$" "h7images"
 echo DONE >> $OUT
