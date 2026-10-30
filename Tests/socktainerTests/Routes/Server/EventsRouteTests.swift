@@ -122,13 +122,30 @@ struct EventsRouteTests {
         }
     }
 
+    /// The window lies an hour ahead and the events carry explicit timestamps, so
+    /// what gets dropped depends only on those timestamps, not on how long the
+    /// server takes to start under load. The stream is ended by an event past
+    /// `until` (moby's other end condition) rather than by the wall-clock
+    /// deadline, which `untilInTheNearFuture` covers.
     @Test("live events older than since are dropped; until still ends the stream")
     func sinceInTheFutureDropsEvents() async throws {
-        let now = Date().timeIntervalSince1970
-        try await withEventsConnection(query: "?since=\(now + 1)&until=\(now + 1.5)") { conn, broadcaster in
-            await broadcaster.broadcast(Self.event("start"))
+        let now = Int64(Date().timeIntervalSince1970)
+        let since = now + 3600
+        let until = since + 1
+        try await withEventsConnection(query: "?since=\(since)&until=\(until)") { conn, broadcaster in
+            _ = try await Task.detached { try conn.read(until: "\r\n\r\n", timeout: 3) }.value
+            // Broadcast only once the subscription is open, so the events go
+            // through the live stream rather than the history replay.
+            #expect(await Self.eventually { await broadcaster.subscriberCount == 1 })
+
+            await broadcaster.broadcast(Self.event("start", atSecond: now))
+            await broadcaster.broadcast(Self.event("restart", atSecond: since))
+            await broadcaster.broadcast(Self.event("stop", atSecond: until + 1))
             let response = try await Task.detached { try conn.read(until: "0\r\n\r\n", timeout: 5) }.value
             #expect(!response.contains(#""Action":"start""#))
+            // The in-window event still arrives, after the dropped one.
+            #expect(response.contains(#""Action":"restart""#))
+            #expect(!response.contains(#""Action":"stop""#))
         }
     }
 
@@ -143,6 +160,13 @@ struct EventsRouteTests {
 
     private static func event(_ action: String) -> DockerEvent {
         .make(type: "container", action: action, actorID: "web", attributes: ["name": "web"])
+    }
+
+    private static func event(_ action: String, atSecond second: Int64) -> DockerEvent {
+        let made = event(action)
+        return DockerEvent(
+            status: made.status, id: made.id, from: made.from, Type: made.Type, Action: made.Action,
+            Actor: made.Actor, scope: made.scope, time: Int(second), timeNano: UInt64(second) * 1_000_000_000)
     }
 }
 
