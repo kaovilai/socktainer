@@ -19,11 +19,17 @@
 # round trip, buildx) on a self-hosted Apple silicon Mac with Apple container, podman and docker
 # installed. See hack/real-mac/README.md for the runner setup.
 #
-# Self-hosted runners must never run untrusted code: this workflow is only triggered manually or on a
-# schedule, never by pull_request / pull_request_target, and only runs in the kaovilai fork.
+# Self-hosted runners must never run untrusted code: this workflow is only triggered by pushes to the
+# fork's own real-mac/** branches, manually, or on a schedule, never by pull_request /
+# pull_request_target, and only runs in the kaovilai fork. A push tests the pushed commit itself;
+# dispatch tests inputs.ref; the schedule tests explore/full-parity.
 name: real-mac
 
 on:
+  push:
+    branches:
+      - "real-mac/**"
+      - ci/real-mac-runner
   workflow_dispatch:
     inputs:
       ref:
@@ -56,7 +62,7 @@ jobs:
       - name: Check out socktainer under test
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || 'explore/full-parity' }}
+          ref: ${{ github.event_name == 'push' && github.sha || inputs.ref || 'explore/full-parity' }}
           path: src
           persist-credentials: false
 

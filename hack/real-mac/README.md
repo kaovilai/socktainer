@@ -67,13 +67,26 @@ user's container API server and listens on `~/.socktainer/container.sock`.
 
 ## Run it
 
+To test ref X, push it to a `real-mac/` branch on the fork; the run builds and tests the pushed commit:
+
 ```sh
-gh workflow run real-mac.yaml --repo kaovilai/socktainer --ref ci/real-mac-runner -f ref=explore/full-parity
+git push origin X:refs/heads/real-mac/X
 ```
 
-`--ref` selects the branch that holds the workflow and these scripts; `ref` is the socktainer revision under
-test. GitHub only fires the nightly `schedule` from the repository's default branch, so the cron is inert
-until the workflow is on the fork's default branch.
+A push runs the workflow file from the pushed commit, so X must contain this workflow and `hack/real-mac/`.
+For a ref that doesn't (e.g. `explore/full-parity`), put the `ci/real-mac-runner` commits on top first; they
+only add new files, so the cherry-pick never conflicts:
+
+```sh
+git fetch origin
+git checkout -B real-mac/X X
+git cherry-pick origin/explore/full-parity..origin/ci/real-mac-runner
+git push -f origin real-mac/X
+```
+
+Pushes to `ci/real-mac-runner` itself also run it. `workflow_dispatch` (`-f ref=<rev>`, harness from
+`--ref`) and the nightly `schedule` (tests `explore/full-parity`) only start working once the workflow
+is on the fork's default branch, which it deliberately is not.
 
 Results (`hunt3-results.txt`, `hunt7-results.txt`, `socktainer.log`, tested SHA) are uploaded as the
 `real-mac-results` artifact and summarized on the run page.
