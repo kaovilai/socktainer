@@ -1,0 +1,127 @@
+#
+# Copyright (C) 2025 Red Hat, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Real-client hunt (hack/real-mac/hunt3.sh + hunt7.sh: podman/docker builds, multi-arch, registry
+# round trip, buildx) on a self-hosted Apple silicon Mac with Apple container, podman and docker
+# installed. See hack/real-mac/README.md for the runner setup.
+#
+# Self-hosted runners must never run untrusted code: this workflow is only triggered manually or on a
+# schedule, never by pull_request / pull_request_target, and only runs in the kaovilai fork.
+name: real-mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: socktainer branch, tag or SHA to build and test
+        required: true
+        default: explore/full-parity
+  schedule:
+    - cron: "17 6 * * *"
+
+concurrency:
+  group: real-mac
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  hunt:
+    name: hunt3 + hunt7
+    if: github.repository == 'kaovilai/socktainer'
+    runs-on: [self-hosted, macOS, ARM64, socktainer]
+    timeout-minutes: 150
+    steps:
+      - name: Check out harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Check out socktainer under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || 'explore/full-parity' }}
+          path: src
+          persist-credentials: false
+
+      - name: Show versions
+        run: |
+          export PATH=/usr/local/bin:/opt/podman/bin:$HOME/bin:$PATH
+          sw_vers
+          swift --version
+          container --version
+          container system status
+          podman --version
+          docker --version
+          git -C src log -1 --format='socktainer under test: %H %s'
+
+      - name: Build
+        working-directory: src
+        run: swift build
+
+      - name: Start socktainer
+        working-directory: src
+        run: |
+          pkill -f '\.build/.*/socktainer' || true
+          sleep 2
+          nohup .build/debug/socktainer < /dev/null > "$RUNNER_TEMP/socktainer.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/socktainer.pid"
+          for i in $(seq 1 60); do
+            if [ "$(curl -s -m 5 --unix-socket "$HOME/.socktainer/container.sock" http://d/_ping)" = OK ]; then
+              echo "socktainer up after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "socktainer did not come up"; cat "$RUNNER_TEMP/socktainer.log"; exit 1
+
+      - name: Run hunt3 + hunt7
+        run: |
+          # the hunt scripts expect their timeout wrapper in $HOME and write ~/huntN-results.txt
+          cp harness/hack/real-mac/ptimeout.pl "$HOME/ptimeout.pl"
+          rm -f "$HOME/hunt3-results.txt" "$HOME/hunt7-results.txt"
+          perl "$HOME/ptimeout.pl" 3600 zsh harness/hack/real-mac/hunt3.sh || echo "hunt3 exited $?"
+          perl "$HOME/ptimeout.pl" 3600 zsh harness/hack/real-mac/hunt7.sh || echo "hunt7 exited $?"
+
+      - name: Collect results
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/results"
+          cp "$HOME/hunt3-results.txt" "$HOME/hunt7-results.txt" "$RUNNER_TEMP/socktainer.log" "$RUNNER_TEMP/results/" 2>/dev/null || true
+          git -C src rev-parse HEAD > "$RUNNER_TEMP/results/socktainer-sha.txt" || true
+
+      - name: Summarize
+        run: |
+          set -o pipefail
+          zsh harness/hack/real-mac/summarize.sh "$RUNNER_TEMP/results/hunt3-results.txt" "$RUNNER_TEMP/results/hunt7-results.txt" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: real-mac-results
+          path: ${{ runner.temp }}/results/
+          if-no-files-found: warn
+
+      - name: Stop socktainer
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/socktainer.pid" ]; then kill "$(cat "$RUNNER_TEMP/socktainer.pid")" 2>/dev/null || true; fi
+          sleep 2
+          pkill -f '\.build/.*/socktainer' || true
