@@ -1,3 +1,4 @@
+import ContainerResource
 import Vapor
 
 struct ContainerRestartRoute: RouteCollection {
@@ -29,6 +30,16 @@ extension ContainerRestartRoute {
                 await ContainerRestartState.shared.reset(id: nativeId)
             }
 
+            let broadcaster = req.application.storage[EventBroadcasterKey.self]!
+            // moby's restart stops a running container through containerStop, which logs `kill`
+            // before the signal goes out. The reset above retired the run's exit observer, so the
+            // `die` and `stop` that follow are logged here once the stop is done.
+            let wasRunning = snapshot?.status == .running
+            let exitGeneration = await ContainerExitCodeStore.shared.generation(id: snapshot?.id ?? id)
+            if let snapshot, wasRunning {
+                await broadcaster.broadcast(Self.killEvent(container: snapshot, signal: signal))
+            }
+
             do {
                 try await client.restart(id: id, signal: signal, timeout: timeout)
             } catch ClientContainerError.notFound {
@@ -48,19 +59,13 @@ extension ContainerRestartRoute {
             // exit would find the previous run's claim held and go unreported.
             let runEpoch = await DieEventOwnership.shared.beginRestartedRun(id: snapshot?.id ?? id)
 
-            let broadcaster = req.application.storage[EventBroadcasterKey.self]!
-            // Carry the canonical 64-char Docker id, not the raw request
-            // reference (name or short id), so clients can correlate this
-            // event with start/kill/die (same pattern as those routes).
-            let event = DockerEvent.simpleEvent(
-                id: snapshot.map { DockerContainerID.hexId(for: $0) } ?? id,
-                type: "container",
-                status: "restart",
-                image: snapshot?.configuration.image.reference ?? "",
-                name: snapshot?.id ?? id,
-                labels: LabelNormalization.restore(snapshot?.configuration.labels ?? [:])
-            )
-            await broadcaster.broadcast(event)
+            // A code is only known if the stopped run's exit was recorded by now. Apple's init
+            // process `wait()` follows the container, not the run, so its waiter usually resolves
+            // with the *next* run's exit; the `die` then goes without an exit code.
+            let exitCode = await ContainerExitCodeStore.shared.get(id: snapshot?.id ?? id, recordedAfter: exitGeneration)
+            for event in Self.completionEvents(id: id, snapshot: snapshot, wasRunning: wasRunning, exitCode: exitCode) {
+                await broadcaster.broadcast(event)
+            }
 
             // Re-arm restart-policy enforcement the same way /start does — otherwise a
             // manually-restarted container has no observer watching its next exit.
@@ -94,5 +99,38 @@ extension ContainerRestartRoute {
 
             return .noContent
         }
+    }
+
+    /// The `kill` moby's containerStop logs for the stop signal (SIGTERM by default) as a number.
+    static func killEvent(container: ContainerSnapshot, signal: String?) -> DockerEvent {
+        let signalNumber = (try? parseSignal(signal ?? "SIGTERM")) ?? SIGTERM
+        return DockerEvent.containerEvent("kill", container: container, extraAttributes: ["signal": String(signalNumber)])
+    }
+
+    /// The events moby logs once a restart's stop and start are done: `die` (with the exit code
+    /// when it is known) and `stop` for a container that was running, then `start` and `restart`.
+    static func completionEvents(id: String, snapshot: ContainerSnapshot?, wasRunning: Bool, exitCode: Int32?) -> [DockerEvent] {
+        // Carry the canonical 64-char Docker id, not the raw request
+        // reference (name or short id), so clients can correlate these
+        // events with start/kill/die (same pattern as those routes).
+        func event(_ status: String, extra: [String: String] = [:]) -> DockerEvent {
+            DockerEvent.simpleEvent(
+                id: snapshot.map { DockerContainerID.hexId(for: $0) } ?? id,
+                type: "container",
+                status: status,
+                image: snapshot?.configuration.image.reference ?? "",
+                name: snapshot?.id ?? id,
+                labels: LabelNormalization.restore(snapshot?.configuration.labels ?? [:]),
+                extraAttributes: extra
+            )
+        }
+        var events: [DockerEvent] = []
+        if wasRunning {
+            events.append(event("die", extra: exitCode.map { ["exitCode": String($0)] } ?? [:]))
+            events.append(event("stop"))
+        }
+        events.append(event("start"))
+        events.append(event("restart"))
+        return events
     }
 }
