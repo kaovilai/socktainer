@@ -830,3 +830,44 @@ struct ContainerCreateAnonymousMountTests {
         }
     }
 }
+
+@Suite("ContainerCreateRoute — missing host platform fallback")
+struct ContainerCreateRoutePlatformFallbackTests {
+    private let arm64 = Platform(arch: "arm64", os: "linux", variant: "v8")
+
+    @Test("a locally cached image without the host platform falls back when no platform was requested")
+    func cachedImageMissingHostPlatformFallsBack() {
+        // Apple's ClientImage.fetch throws this when the image is in the local store but has
+        // no manifest for the requested platform (e.g. an amd64-only image on an arm64 host).
+        let err = ContainerizationError(.unsupported, message: "platform linux/arm64/v8")
+        #expect(ContainerCreateRoute.isMissingPlatformError(err, explicitPlatform: false))
+    }
+
+    @Test("an explicit --platform the cached image lacks is not silently swapped")
+    func explicitPlatformMismatchIsPreserved() {
+        let err = ContainerizationError(.unsupported, message: "platform linux/arm64/v8")
+        #expect(!ContainerCreateRoute.isMissingPlatformError(err, explicitPlatform: true))
+    }
+
+    @Test("pull-time platform errors fall back regardless of an explicit platform")
+    func pullErrorsFallBack() {
+        let err = ContainerizationError(.unsupported, message: "image does not support required platforms")
+        #expect(ContainerCreateRoute.isMissingPlatformError(err, explicitPlatform: true))
+        #expect(ContainerCreateRoute.isMissingPlatformError(err, explicitPlatform: false))
+    }
+
+    @Test("unrelated errors do not trigger the fallback")
+    func unrelatedErrorsDoNotFallBack() {
+        #expect(!ContainerCreateRoute.isMissingPlatformError(ContainerizationError(.unsupported, message: "compression"), explicitPlatform: false))
+        #expect(!ContainerCreateRoute.isMissingPlatformError(ContainerizationError(.notFound, message: "platform linux/arm64"), explicitPlatform: false))
+    }
+
+    @Test("the mismatch warning follows Docker's wording")
+    func mismatchWarningWording() {
+        let warning = ContainerCreateRoute.platformMismatchWarning(image: Platform(arch: "amd64", os: "linux", variant: nil), host: arm64)
+        #expect(
+            warning
+                == "The requested image's platform (linux/amd64) does not match the detected host platform (linux/arm64) and no specific platform was requested"
+        )
+    }
+}

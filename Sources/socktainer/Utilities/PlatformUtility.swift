@@ -80,6 +80,26 @@ public func platformsRequireQEMU(_ platforms: [Platform]) -> Bool {
     platforms.contains(where: platformRequiresQEMU)
 }
 
+/// The amd64 (Rosetta) platform to run when `requested` (arm64) is missing.
+///
+/// When the local image has exactly one runnable amd64 manifest, its exact platform is
+/// used so a variant (e.g. `linux/amd64/v3`) still matches Apple's exact-equality
+/// manifest lookup. Attestation manifests (`unknown/unknown`) are ignored. Otherwise —
+/// image not cached, or several amd64 variants — plain `<os>/amd64`.
+public func rosettaFallbackPlatform(for requested: Platform, imageManifests: [Descriptor]?) -> Platform {
+    let runnable = (imageManifests ?? []).compactMap { descriptor -> Platform? in
+        guard descriptor.annotations?["vnd.docker.reference.type"] != "attestation-manifest",
+            let platform = descriptor.platform,
+            platform.os == requested.os, platform.architecture == "amd64"
+        else { return nil }
+        return platform
+    }
+    if runnable.count == 1, let only = runnable.first {
+        return only
+    }
+    return Platform(arch: "amd64", os: requested.os, variant: nil)
+}
+
 public func requestedOrDefaultPlatform(_ requestedPlatform: Platform?) -> Platform {
     requestedPlatform ?? Platform.current
 }
