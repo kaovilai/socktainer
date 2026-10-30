@@ -1,3 +1,4 @@
+import ContainerizationOCI
 import Testing
 
 @testable import socktainer
@@ -166,5 +167,39 @@ struct PlatformParsingTests {
         let qemu = platforms.filter { platformRequiresQEMU($0) }
         #expect(rosetta.map(\.architecture) == ["arm64"])
         #expect(qemu.map(\.architecture) == ["s390x"])
+    }
+}
+
+@Suite("rosettaFallbackPlatform")
+struct RosettaFallbackPlatformTests {
+    private let arm64 = Platform(arch: "arm64", os: "linux", variant: "v8")
+
+    private func manifest(_ platform: Platform, attestation: Bool = false) -> Descriptor {
+        Descriptor(
+            mediaType: MediaTypes.imageManifest,
+            digest: "sha256:\(platform.description.replacingOccurrences(of: "/", with: "-"))",
+            size: 0,
+            annotations: attestation ? ["vnd.docker.reference.type": "attestation-manifest"] : nil,
+            platform: platform
+        )
+    }
+
+    @Test("the image's single amd64 manifest is used, ignoring attestation manifests")
+    func singleRunnablePlatformIsUsed() {
+        let amd64v3 = Platform(arch: "amd64", os: "linux", variant: "v3")
+        let unknown = Platform(arch: "unknown", os: "unknown", variant: nil)
+        let chosen = rosettaFallbackPlatform(
+            for: arm64,
+            imageManifests: [manifest(amd64v3), manifest(unknown, attestation: true)]
+        )
+        #expect(chosen == amd64v3)
+    }
+
+    @Test("no cached image or several amd64 variants falls back to plain linux/amd64")
+    func defaultsToPlainAmd64() {
+        let plain = Platform(arch: "amd64", os: "linux", variant: nil)
+        #expect(rosettaFallbackPlatform(for: arm64, imageManifests: nil) == plain)
+        let several = [manifest(Platform(arch: "amd64", os: "linux", variant: "v2")), manifest(Platform(arch: "amd64", os: "linux", variant: "v3"))]
+        #expect(rosettaFallbackPlatform(for: arm64, imageManifests: several) == plain)
     }
 }

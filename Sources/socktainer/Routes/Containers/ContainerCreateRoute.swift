@@ -157,10 +157,15 @@ extension ContainerCreateRoute {
             }
 
             // Fetch the image; on arm64 hosts fall back to amd64 (Rosetta) when no arm64
-            // variant is available. Two cases handled:
+            // variant is available. Cases handled:
             //   1. Fetch fails (image not cached, pull returns "does not support required platforms")
             //   2. Fetch succeeds but image is cached as amd64 — config(for: arm64) returns nil
+            //   3. Image is cached without an arm64 manifest and no platform was requested —
+            //      Apple's fetch throws `.unsupported "platform linux/arm64"`; like Docker, run
+            //      the image's own platform and warn about the mismatch.
             // containerConfiguration.rosetta is set below when requestedPlatform becomes amd64.
+            let explicitPlatform = query.platform?.isEmpty == false
+            var createWarnings: [String] = []
             var img: ClientImage
             do {
                 img = try await ClientImage.fetch(
@@ -177,19 +182,22 @@ extension ContainerCreateRoute {
                 }
             } catch let fetchError
                 where requestedPlatform.architecture == "arm64"
-                && {
-                    let msg = String(describing: fetchError)
-                    return msg.contains("does not support required platforms") || msg.contains("no arm64 content")
-                }()
+                && ContainerCreateRoute.isMissingPlatformError(fetchError, explicitPlatform: explicitPlatform)
             {
-                let amd64 = Platform(arch: "amd64", os: requestedPlatform.os, variant: nil)
-                req.logger.info("\(body.Image) has no arm64 variant — falling back to amd64 (Rosetta)")
+                // Prefer the cached image's own amd64 manifest (it may carry a variant); a
+                // pull or multi-variant image falls back to plain linux/amd64.
+                let localManifests = try? await ClientImage.get(reference: imageReference, containerSystemConfig: systemConfig).index().manifests
+                let amd64 = rosettaFallbackPlatform(for: requestedPlatform, imageManifests: localManifests)
+                req.logger.info("\(body.Image) has no arm64 variant — falling back to \(amd64.description) (Rosetta)")
                 img = try await ClientImage.fetch(
                     reference: imageReference,
                     platform: amd64,
                     scheme: RegistryScheme.scheme(forReference: imageReference, internalDnsDomain: systemConfig.dns.domain),
                     containerSystemConfig: systemConfig
                 )
+                if !explicitPlatform {
+                    createWarnings.append(ContainerCreateRoute.platformMismatchWarning(image: amd64, host: requestedPlatform))
+                }
                 requestedPlatform = amd64
             }
 
@@ -831,7 +839,7 @@ extension ContainerCreateRoute {
                 await broadcaster.broadcast(ContainerCreateRoute.makeCreateEvent(for: container))
             }
             // Docker Engine API: POST /containers/create returns 201 Created.
-            let createResponse = RESTContainerCreate(Id: hexId, Warnings: [])
+            let createResponse = RESTContainerCreate(Id: hexId, Warnings: createWarnings)
             let httpResponse = try await createResponse.encodeResponse(for: req)
             httpResponse.status = .created
             return httpResponse
@@ -855,6 +863,27 @@ extension ContainerCreateRoute {
         if let net = endpointsConfigKeys.first(where: { !$0.isEmpty && !reservedModes.contains($0) }) { return net }
         if let mode = networkMode, !mode.isEmpty, !reservedModes.contains(mode) { return mode }
         return nil
+    }
+
+    /// Whether a failed image fetch means only that the image lacks the requested platform.
+    ///
+    /// A pull reports "does not support required platforms"; an image already in the local
+    /// store makes Apple's `ClientImage.fetch` throw `.unsupported "platform <p>"`. The
+    /// latter only triggers a fallback when no platform was requested — Docker rejects an
+    /// explicit `--platform` the local image does not match.
+    static func isMissingPlatformError(_ error: Error, explicitPlatform: Bool) -> Bool {
+        let msg = String(describing: error)
+        if msg.contains("does not support required platforms") || msg.contains("no arm64 content") {
+            return true
+        }
+        guard !explicitPlatform, let containerError = error as? ContainerizationError else { return false }
+        return containerError.code == .unsupported && containerError.message.hasPrefix("platform ")
+    }
+
+    /// Docker's create warning when no platform was requested and the image's platform
+    /// differs from the host's.
+    static func platformMismatchWarning(image: Platform, host: Platform) -> String {
+        "The requested image's platform (\(image.description)) does not match the detected host platform (\(host.description)) and no specific platform was requested"
     }
 
     /// Maps an error from the pre-flight image existence check to a client-facing error.
