@@ -261,6 +261,31 @@ struct ClientImageServiceLoadTests {
         #expect(config["architecture"] as? String == Platform.current.architecture)
     }
 
+    @Test("a save never tags an attestation manifest, so a load keeps the runnable platform")
+    func saveSkipsAttestationManifest() async throws {
+        let fixture = try ImageTarballFixture()
+        defer { fixture.cleanUp() }
+
+        let image = try fixture.writeImage(arch: Platform.current.architecture)
+        let index = try fixture.nestedIndex(of: [image, fixture.writeAttestation(for: image)])
+        let reference = "docker.io/library/crafted-attested:latest"
+        try await fixture.storeAsPulled(index, reference: reference)
+
+        let saved = try await fixture.saveTarball(references: [reference])
+        let extracted = fixture.workDir.appendingPathComponent("extracted-attested")
+        try ArchiveUtility.extract(tarPath: saved, to: extracted, logger: fixture.logger)
+
+        let manifests = try #require(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: extracted.appendingPathComponent("manifest.json"))) as? [[String: Any]])
+        #expect(manifests.count == 1)
+        let configName = try #require(manifests.first?["Config"] as? String)
+        let config = try #require(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: extracted.appendingPathComponent(configName))) as? [String: Any])
+        #expect(config["architecture"] as? String == Platform.current.architecture)
+        #expect(config["os"] as? String == "linux")
+        #expect(try await fixture.loadIntoEmptyStore(saved) == [reference])
+    }
+
     @Test("saving a platform the image has no content for is reported as not found")
     func savingAbsentPlatformIsNotFound() async throws {
         let fixture = try ImageTarballFixture()
@@ -352,6 +377,29 @@ private struct ImageTarballFixture {
             digest: written.digest,
             size: written.size,
             platform: Platform(arch: arch, os: "linux")
+        )
+    }
+
+    /// A BuildKit provenance manifest for `image`, as Docker Hub lists next to each platform:
+    /// an image manifest whose platform and config are `unknown/unknown`.
+    func writeAttestation(for image: Descriptor) throws -> Descriptor {
+        let statement = try writeBlob(Data(#"{"_type":"https://in-toto.io/Statement/v0.1"}"#.utf8))
+        let config = try writeBlob(
+            Data(#"{"architecture":"unknown","os":"unknown","config":{},"rootfs":{"type":"layers","diff_ids":["\#(statement.digest)"]}}"#.utf8))
+        let manifest = Manifest(
+            config: Descriptor(mediaType: MediaTypes.imageConfig, digest: config.digest, size: config.size),
+            layers: [Descriptor(mediaType: "application/vnd.in-toto+json", digest: statement.digest, size: statement.size)]
+        )
+        let written = try writeBlob(JSONEncoder().encode(manifest))
+        return Descriptor(
+            mediaType: MediaTypes.imageManifest,
+            digest: written.digest,
+            size: written.size,
+            annotations: [
+                "vnd.docker.reference.digest": image.digest,
+                "vnd.docker.reference.type": "attestation-manifest",
+            ],
+            platform: Platform(arch: "unknown", os: "unknown")
         )
     }
 
