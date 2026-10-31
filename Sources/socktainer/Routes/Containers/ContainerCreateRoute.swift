@@ -762,8 +762,21 @@ extension ContainerCreateRoute {
                 // Foreign architectures (s390x, ppc64le, riscv64) run under QEMU: the init
                 // process registers binfmt_misc in the container's own VM, then execs the command.
                 if let qemuHandler = QEMURuntime.handler(for: requestedPlatform) {
-                    let assets = try await QEMURuntime.ensureAssets(handler: qemuHandler, containerSystemConfig: systemConfig, logger: req.logger)
-                    QEMURuntime.apply(to: &containerConfiguration, handler: qemuHandler, assetDirectory: assets)
+                    let assets = try await QEMURuntime.ensureAssets(handlers: [qemuHandler], containerSystemConfig: systemConfig, logger: req.logger)
+                    QEMURuntime.apply(to: &containerConfiguration, handlers: [qemuHandler], assetDirectory: assets)
+                } else if ContainerCreateRoute.emulatesForeignPlatforms(hostConfig: body.HostConfig, platform: requestedPlatform) {
+                    // Like Docker Desktop, a privileged arm64 container can run amd64 binaries
+                    // (Rosetta) and s390x/ppc64le/riscv64 ones (QEMU), so emulators inside it
+                    // work: buildx's docker-container driver detects these as build platforms.
+                    // Best-effort: without the assets the container still runs natively.
+                    containerConfiguration.rosetta = true
+                    do {
+                        let handlers = QEMURuntime.allHandlers
+                        let assets = try await QEMURuntime.ensureAssets(handlers: handlers, containerSystemConfig: systemConfig, logger: req.logger)
+                        QEMURuntime.apply(to: &containerConfiguration, handlers: handlers, assetDirectory: assets, required: false)
+                    } catch {
+                        req.logger.warning("[qemu] emulators unavailable for privileged container \(id): \(error)")
+                    }
                 }
                 // Always overwrite client-supplied metadata, including an empty list.
                 containerConfiguration.labels[ContainerAnonymousVolumes.label] =
@@ -1044,6 +1057,12 @@ extension ContainerCreateRoute {
     /// own builder container) is what actually unblocks the rbind mounts buildx's
     /// docker-container driver needs (issue #361) — `Privileged` was previously decoded
     /// but never consulted anywhere, so it was silently dropped.
+    /// Whether a container gets Rosetta and QEMU binfmt handlers on top of its native
+    /// platform: privileged arm64 Linux containers on an arm64 host.
+    static func emulatesForeignPlatforms(hostConfig: HostConfig?, platform: Platform, host: Platform = .current) -> Bool {
+        hostConfig?.Privileged == true && host.architecture == "arm64" && platform.architecture == "arm64" && platform.os == "linux"
+    }
+
     static func requestedCapAdd(hostConfig: HostConfig?) -> [String] {
         var capAdd = hostConfig?.CapAdd ?? []
         if hostConfig?.Privileged == true, !capAdd.contains(where: { $0.uppercased() == "ALL" }) {

@@ -56,7 +56,7 @@ struct QEMURuntimeTests {
     @Test("wrap runs busybox sh as root and passes the original command as $@")
     func wrapRoot() throws {
         let handler = try #require(QEMURuntime.handler(for: "s390x"))
-        let wrapped = QEMURuntime.wrap(process(), handler: handler)
+        let wrapped = QEMURuntime.wrap(process(), handlers: [handler])
         #expect(wrapped.executable == "/.socktainer-qemu/busybox")
         #expect(Array(wrapped.arguments.prefix(2)) == ["sh", "-c"])
         #expect(Array(wrapped.arguments.suffix(3)) == ["socktainer-qemu", "uname", "-m"])
@@ -72,7 +72,7 @@ struct QEMURuntimeTests {
     @Test("a non-root user is switched to with chpst after registration")
     func wrapNonRoot() throws {
         let handler = try #require(QEMURuntime.handler(for: "s390x"))
-        let script = QEMURuntime.wrap(process(user: .raw(userString: "nobody")), handler: handler).arguments[2]
+        let script = QEMURuntime.wrap(process(user: .raw(userString: "nobody")), handlers: [handler]).arguments[2]
         #expect(script.hasSuffix("exec /.socktainer-qemu/busybox chpst -u 'nobody' \"$@\""))
         #expect(QEMURuntime.chpstUser(.id(uid: 1000, gid: 100)) == "1000:100")
         #expect(QEMURuntime.chpstUser(.raw(userString: "root")) == nil)
@@ -84,7 +84,7 @@ struct QEMURuntimeTests {
         let handler = try #require(QEMURuntime.handler(for: "s390x"))
         var cfg = config(process())
         cfg.capDrop = ["CAP_SYS_ADMIN"]
-        QEMURuntime.apply(to: &cfg, handler: handler, assetDirectory: URL(fileURLWithPath: "/tmp/q"))
+        QEMURuntime.apply(to: &cfg, handlers: [handler], assetDirectory: URL(fileURLWithPath: "/tmp/q"))
         let mount = try #require(cfg.mounts.first { $0.destination == "/.socktainer-qemu" })
         #expect(mount.source == "/tmp/q")
         #expect(mount.options.contains("ro"))
@@ -99,8 +99,31 @@ struct QEMURuntimeTests {
         let handler = try #require(QEMURuntime.handler(for: "s390x"))
         var cfg = config(process())
         cfg.capAdd = ["ALL"]
-        QEMURuntime.apply(to: &cfg, handler: handler, assetDirectory: URL(fileURLWithPath: "/tmp/q"))
+        QEMURuntime.apply(to: &cfg, handlers: [handler], assetDirectory: URL(fileURLWithPath: "/tmp/q"))
         #expect(cfg.capAdd == ["ALL"])
+    }
+
+    @Test("best-effort wrapper for privileged containers registers every handler without exiting")
+    func bestEffortAllHandlers() {
+        let script = QEMURuntime.wrapperScript(handlers: QEMURuntime.allHandlers, user: .id(uid: 0, gid: 0), required: false)
+        for arch in ["s390x", "ppc64le", "riscv64"] {
+            #expect(script.contains(":qemu-\(arch):M::"))
+        }
+        #expect(!script.contains("exit 126"))
+        var cfg = config(process())
+        QEMURuntime.apply(to: &cfg, handlers: QEMURuntime.allHandlers, assetDirectory: URL(fileURLWithPath: "/tmp/q"), required: false)
+        #expect(cfg.labels[QEMURuntime.label] == "s390x,ppc64le,riscv64")
+    }
+
+    @Test("only privileged arm64 linux containers emulate foreign platforms")
+    func privilegedEmulation() throws {
+        let arm64 = Platform(arch: "arm64", os: "linux", variant: "v8")
+        let privileged = try JSONDecoder().decode(HostConfig.self, from: Data(#"{"Privileged":true}"#.utf8))
+        let plain = try JSONDecoder().decode(HostConfig.self, from: Data(#"{}"#.utf8))
+        #expect(ContainerCreateRoute.emulatesForeignPlatforms(hostConfig: privileged, platform: arm64, host: arm64Host))
+        #expect(!ContainerCreateRoute.emulatesForeignPlatforms(hostConfig: plain, platform: arm64, host: arm64Host))
+        #expect(!ContainerCreateRoute.emulatesForeignPlatforms(hostConfig: nil, platform: arm64, host: arm64Host))
+        #expect(!ContainerCreateRoute.emulatesForeignPlatforms(hostConfig: privileged, platform: Platform(arch: "amd64", os: "linux"), host: arm64Host))
     }
 }
 

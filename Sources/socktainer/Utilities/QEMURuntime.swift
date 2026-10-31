@@ -79,16 +79,25 @@ enum QEMURuntime {
         return handler(for: platform.architecture)
     }
 
+    /// Every handler, registered in privileged containers so emulators running inside them
+    /// (buildx's buildkitd) can execute foreign binaries, as on Docker Desktop.
+    static var allHandlers: [Handler] { ["s390x", "ppc64le", "riscv64"].compactMap { handler(for: $0) } }
+
     /// The shell script the wrapper runs with `busybox sh -c`. `$@` is the original command.
-    /// A non-root user is switched to with busybox `chpst` after registration.
-    static func wrapperScript(handler: Handler, user: ProcessConfiguration.User) -> String {
+    /// A non-root user is switched to with busybox `chpst` after registration. When
+    /// `required`, a failed registration stops the container (exit 126); otherwise it is skipped.
+    static func wrapperScript(handlers: [Handler], user: ProcessConfiguration.User, required: Bool = true) -> String {
         let busybox = "\(mountPoint)/\(busyboxName)"
-        let entry = "/proc/sys/fs/binfmt_misc/\(handler.interpreterName)"
-        let registration = handler.registration(interpreterPath: "\(mountPoint)/\(handler.interpreterName)")
-        var lines = [
-            "\(busybox) mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null",
-            "[ -e \(entry) ] || echo '\(registration)' > /proc/sys/fs/binfmt_misc/register || { echo 'socktainer: cannot register \(handler.interpreterName) with binfmt_misc' >&2; exit 126; }",
-        ]
+        var lines = ["\(busybox) mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null"]
+        for handler in handlers {
+            let entry = "/proc/sys/fs/binfmt_misc/\(handler.interpreterName)"
+            let registration = handler.registration(interpreterPath: "\(mountPoint)/\(handler.interpreterName)")
+            let onFailure =
+                required
+                ? " || { echo 'socktainer: cannot register \(handler.interpreterName) with binfmt_misc' >&2; exit 126; }"
+                : " 2>/dev/null"
+            lines.append("[ -e \(entry) ] || echo '\(registration)' > /proc/sys/fs/binfmt_misc/register\(onFailure)")
+        }
         if let chpstUser = chpstUser(user) {
             lines.append("exec \(busybox) chpst -u '\(chpstUser)' \"$@\"")
         } else {
@@ -113,24 +122,26 @@ enum QEMURuntime {
     }
 
     /// Wraps `process` so the container's init registers QEMU before running the original command.
-    static func wrap(_ process: ProcessConfiguration, handler: Handler) -> ProcessConfiguration {
+    static func wrap(_ process: ProcessConfiguration, handlers: [Handler], required: Bool = true) -> ProcessConfiguration {
         var wrapped = process
         wrapped.executable = "\(mountPoint)/\(busyboxName)"
-        wrapped.arguments = ["sh", "-c", wrapperScript(handler: handler, user: process.user), "socktainer-qemu", process.executable] + process.arguments
+        wrapped.arguments =
+            ["sh", "-c", wrapperScript(handlers: handlers, user: process.user, required: required), "socktainer-qemu", process.executable]
+            + process.arguments
         wrapped.user = .id(uid: 0, gid: 0)
         return wrapped
     }
 
     /// Applies emulation to a container configuration: wrapped init, read-only asset mount,
-    /// CAP_SYS_ADMIN, and a label naming the emulated architecture.
-    static func apply(to config: inout ContainerConfiguration, handler: Handler, assetDirectory: URL) {
-        config.initProcess = wrap(config.initProcess, handler: handler)
+    /// CAP_SYS_ADMIN, and a label naming the registered architectures.
+    static func apply(to config: inout ContainerConfiguration, handlers: [Handler], assetDirectory: URL, required: Bool = true) {
+        config.initProcess = wrap(config.initProcess, handlers: handlers, required: required)
         config.mounts.append(.virtiofs(source: assetDirectory.path, destination: mountPoint, options: ["ro"]))
         if !config.capAdd.contains(where: { $0.uppercased() == "ALL" || $0.uppercased() == requiredCapability }) {
             config.capAdd.append(requiredCapability)
         }
         config.capDrop.removeAll { $0.uppercased() == requiredCapability }
-        config.labels[label] = handler.qemuArch
+        config.labels[label] = handlers.map(\.qemuArch).joined(separator: ",")
     }
 
     // MARK: - Host assets
@@ -142,7 +153,7 @@ enum QEMURuntime {
     /// Makes sure the static busybox and `qemu-<arch>` exist in `assetDirectory`, extracting
     /// them from `busybox:musl` and the BuildKit builder image (which ships static
     /// `buildkit-qemu-*` binaries) on first use.
-    static func ensureAssets(handler: Handler, containerSystemConfig: ContainerSystemConfig, logger: Logger?) async throws -> URL {
+    static func ensureAssets(handlers: [Handler], containerSystemConfig: ContainerSystemConfig, logger: Logger?) async throws -> URL {
         let dir = assetDirectory
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let busybox = dir.appendingPathComponent(busyboxName)
@@ -150,8 +161,9 @@ enum QEMURuntime {
             logger?.info("[qemu] extracting static busybox from \(busyboxImage)")
             try await extract(member: "bin/busybox", from: busyboxImage, to: busybox, containerSystemConfig: containerSystemConfig)
         }
-        let qemu = dir.appendingPathComponent(handler.interpreterName)
-        if !FileManager.default.isExecutableFile(atPath: qemu.path) {
+        for handler in handlers {
+            let qemu = dir.appendingPathComponent(handler.interpreterName)
+            guard !FileManager.default.isExecutableFile(atPath: qemu.path) else { continue }
             let builderImage = containerSystemConfig.build.image
             logger?.info("[qemu] extracting buildkit-qemu-\(handler.qemuArch) from \(builderImage)")
             try await extract(
