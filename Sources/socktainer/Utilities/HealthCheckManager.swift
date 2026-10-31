@@ -332,7 +332,7 @@ actor HealthCheckManager {
             let containerClient = ContainerClient()
             let container = try await containerClient.get(id: containerId)
 
-            let processConfig = probeProcessConfiguration(base: container.configuration.initProcess, cmd: cmd)
+            let processConfig = probeProcessConfiguration(base: container.configuration.dockerProcess, cmd: cmd)
             let processId = "hc-\(UUID().uuidString.lowercased())"
             let process = try await containerClient.createProcess(
                 containerId: containerId,

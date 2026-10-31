@@ -122,7 +122,7 @@ struct CommitRoute: RouteCollection {
             base = [:]
         }
 
-        let process = container.configuration.initProcess
+        let process = container.configuration.dockerProcess
         let composed: [String: Any]
         do {
             composed = try CommitConfigComposer.compose(

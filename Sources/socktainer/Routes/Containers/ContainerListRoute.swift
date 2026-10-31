@@ -120,7 +120,7 @@ extension ContainerListRoute {
                     Image: container.configuration.image.reference,
                     ImageID: container.configuration.image.digest,
                     ImageManifestDescriptor: nil,
-                    Command: ([container.configuration.initProcess.executable] + container.configuration.initProcess.arguments).joined(separator: " "),
+                    Command: ([container.configuration.dockerProcess.executable] + container.configuration.dockerProcess.arguments).joined(separator: " "),
                     Created: createdTimestamp,
                     Ports: ports,
                     SizeRw: nil,  // there is no mechanism to retrieve this value from apple container

@@ -35,7 +35,7 @@ struct ClientContainerCommandRunnerService: ClientContainerCommandRunner {
         guard let executable = command.first else {
             throw ContainerCommandError.startFailed(executable: "", underlying: "empty command")
         }
-        let processConfig = Self.processConfiguration(base: container.configuration.initProcess, command: command, asRoot: asRoot)
+        let processConfig = Self.processConfiguration(base: container.configuration.dockerProcess, command: command, asRoot: asRoot)
 
         guard let pipes = StdioPipes.make([.stdout, .stderr]) else {
             throw ContainerCommandError.startFailed(executable: executable, underlying: "failed to create I/O pipes")

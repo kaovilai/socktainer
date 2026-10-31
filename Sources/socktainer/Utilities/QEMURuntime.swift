@@ -30,8 +30,11 @@ enum QEMURuntime {
     static let busyboxName = "busybox"
     /// The capability the wrapper needs to mount binfmt_misc and write its register file.
     static let requiredCapability = "CAP_SYS_ADMIN"
-    /// Recorded on the container so the original command can be recovered from the wrapper.
+    /// Recorded on the container: the registered architectures, comma-separated.
     static let label = "io.github.socktainer.qemu"
+    /// The original init user (JSON), since the wrapper itself runs as root.
+    static let userLabel = "io.github.socktainer.qemu.user"
+    static let wrapperArgv0 = "socktainer-qemu"
 
     struct Handler: Equatable {
         /// qemu's name for the architecture (`qemu-<name>`, binfmt entry name).
@@ -134,7 +137,7 @@ enum QEMURuntime {
         var wrapped = process
         wrapped.executable = "\(mountPoint)/\(busyboxName)"
         wrapped.arguments =
-            ["sh", "-c", wrapperScript(handlers: handlers, user: process.user, required: required), "socktainer-qemu", process.executable]
+            ["sh", "-c", wrapperScript(handlers: handlers, user: process.user, required: required), wrapperArgv0, process.executable]
             + process.arguments
         wrapped.user = .id(uid: 0, gid: 0)
         return wrapped
@@ -143,13 +146,33 @@ enum QEMURuntime {
     /// Applies emulation to a container configuration: wrapped init, read-only asset mount,
     /// CAP_SYS_ADMIN, and a label naming the registered architectures.
     static func apply(to config: inout ContainerConfiguration, handlers: [Handler], assetDirectory: URL, required: Bool = true) {
-        config.initProcess = wrap(config.initProcess, handlers: handlers, required: required)
+        let original = config.initProcess
+        config.initProcess = wrap(original, handlers: handlers, required: required)
         config.mounts.append(.virtiofs(source: assetDirectory.path, destination: mountPoint, options: ["ro"]))
         if !config.capAdd.contains(where: { $0.uppercased() == "ALL" || $0.uppercased() == requiredCapability }) {
             config.capAdd.append(requiredCapability)
         }
         config.capDrop.removeAll { $0.uppercased() == requiredCapability }
         config.labels[label] = handlers.map(\.qemuArch).joined(separator: ",")
+        if let data = try? JSONEncoder().encode(original.user) {
+            config.labels[userLabel] = String(decoding: data, as: UTF8.self)
+        }
+    }
+
+    /// The process the client asked for: `process` with the wrapper removed. Unchanged for a
+    /// container that was not wrapped.
+    static func unwrapped(_ process: ProcessConfiguration, labels: [String: String]) -> ProcessConfiguration {
+        guard labels[label] != nil, process.executable == "\(mountPoint)/\(busyboxName)",
+            process.arguments.count >= 5, process.arguments[0] == "sh", process.arguments[1] == "-c",
+            process.arguments[3] == wrapperArgv0
+        else { return process }
+        var original = process
+        original.executable = process.arguments[4]
+        original.arguments = Array(process.arguments.dropFirst(5))
+        if let json = labels[userLabel], let user = try? JSONDecoder().decode(ProcessConfiguration.User.self, from: Data(json.utf8)) {
+            original.user = user
+        }
+        return original
     }
 
     // MARK: - Host assets
@@ -224,5 +247,13 @@ enum QEMURuntime {
         tar.standardError = FileHandle.nullDevice
         try tar.run()
         tar.waitUntilExit()
+    }
+}
+
+extension ContainerConfiguration {
+    /// The init process as the client created it, without socktainer's QEMU wrapper. Use it
+    /// wherever the command or user is reported or reused (inspect, ps, exec, commit).
+    var dockerProcess: ProcessConfiguration {
+        QEMURuntime.unwrapped(initProcess, labels: labels)
     }
 }

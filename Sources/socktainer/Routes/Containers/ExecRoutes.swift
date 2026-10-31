@@ -314,7 +314,7 @@ struct ExecRoute: RouteCollection {
             // started: applying them can throw, and doing so after markStarted
             // would leave the exec reported as running forever.
             let baseProcessConfig: ProcessConfiguration = try {
-                var processConfig = container.configuration.initProcess
+                var processConfig = container.configuration.dockerProcess
                 try ExecRoute.applyProcessOverrides(&processConfig, config: config)
                 return processConfig
             }()

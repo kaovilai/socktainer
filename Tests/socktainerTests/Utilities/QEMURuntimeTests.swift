@@ -94,6 +94,29 @@ struct QEMURuntimeTests {
         #expect(cfg.initProcess.executable == "/.socktainer-qemu/busybox")
     }
 
+    @Test("dockerProcess recovers the original command and user from a wrapped init")
+    func unwrapRecoversOriginal() throws {
+        let handler = try #require(QEMURuntime.handler(for: "s390x"))
+        let original = process(user: .raw(userString: "nobody"))
+        var cfg = config(original)
+        QEMURuntime.apply(to: &cfg, handlers: [handler], assetDirectory: URL(fileURLWithPath: "/tmp/q"))
+        #expect(cfg.initProcess.user == .id(uid: 0, gid: 0))
+        let recovered = cfg.dockerProcess
+        #expect(recovered.executable == "uname")
+        #expect(recovered.arguments == ["-m"])
+        #expect(recovered.user == .raw(userString: "nobody"))
+        #expect(recovered.workingDirectory == "/work")
+    }
+
+    @Test("dockerProcess leaves an unwrapped init alone, even if it looks like busybox sh")
+    func unwrapIgnoresPlainProcess() {
+        let plain = ProcessConfiguration(
+            executable: "/.socktainer-qemu/busybox", arguments: ["sh", "-c", "true", "socktainer-qemu", "x"], environment: [],
+            workingDirectory: "/", terminal: false, user: .id(uid: 0, gid: 0))
+        let cfg = config(plain)
+        #expect(cfg.dockerProcess.executable == "/.socktainer-qemu/busybox")
+    }
+
     @Test("apply keeps an existing ALL capability")
     func applyKeepsAll() throws {
         let handler = try #require(QEMURuntime.handler(for: "s390x"))

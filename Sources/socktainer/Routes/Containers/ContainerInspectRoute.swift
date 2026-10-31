@@ -109,27 +109,27 @@ extension ContainerInspectRoute {
                 await RestartPolicyManager.effectivePolicy(hexId: DockerContainerID.hexId(for: container), labels: container.configuration.labels)
                 ?? RestartPolicy(Name: "no", MaximumRetryCount: nil)
 
-            let command = Self.configCommand(labels: container.configuration.labels, process: container.configuration.initProcess)
+            let command = Self.configCommand(labels: container.configuration.labels, process: container.configuration.dockerProcess)
 
             let containerConfig: ContainerConfig = ContainerConfig(
                 // The create route stores the requested hostname on the network attachment.
                 Hostname: container.configuration.networks.first?.options.hostname ?? container.id,
                 Domainname: container.configuration.dns?.domain,
-                User: getUserString(from: container.configuration.initProcess.user),
+                User: getUserString(from: container.configuration.dockerProcess.user),
                 AttachStdin: false,  // no mechanism to derive this value
                 AttachStdout: true,  // no mechanism to derive this value
                 AttachStderr: true,  // no mechanism to derive this value
                 ExposedPorts: exposedPorts.isEmpty ? nil : exposedPorts,
-                Tty: container.configuration.initProcess.terminal,
+                Tty: container.configuration.dockerProcess.terminal,
                 OpenStdin: ContainerStdinRegistry.opensStdin(container),
                 StdinOnce: false,  // no mechanism to derive this value
-                Env: container.configuration.initProcess.environment.isEmpty ? nil : container.configuration.initProcess.environment,
+                Env: container.configuration.dockerProcess.environment.isEmpty ? nil : container.configuration.dockerProcess.environment,
                 Cmd: command.Cmd,
                 Healthcheck: healthcheckConfig,
                 ArgsEscaped: false,  // no mechanism to derive this value
                 Image: container.configuration.image.reference,
                 Volumes: nil,  // Could be derived from mounts if needed
-                WorkingDir: container.configuration.initProcess.workingDirectory.isEmpty ? nil : container.configuration.initProcess.workingDirectory,
+                WorkingDir: container.configuration.dockerProcess.workingDirectory.isEmpty ? nil : container.configuration.dockerProcess.workingDirectory,
                 Entrypoint: command.Entrypoint,
                 NetworkDisabled: container.configuration.networks.isEmpty,
                 MacAddress: nil,  // no mechanism to derive this value
@@ -199,8 +199,8 @@ extension ContainerInspectRoute {
             return RESTContainerInspect(
                 Id: DockerContainerID.hexId(for: container),
                 Created: AppleContainerTimestampResolver.iso8601Timestamp(createdAt),
-                Path: container.configuration.initProcess.executable,
-                Args: container.configuration.initProcess.arguments,
+                Path: container.configuration.dockerProcess.executable,
+                Args: container.configuration.dockerProcess.arguments,
                 State: containerState,
                 Image: container.configuration.image.reference,
                 ResolvConfPath: "/etc/resolv.conf",
