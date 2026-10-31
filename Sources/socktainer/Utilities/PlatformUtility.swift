@@ -100,6 +100,22 @@ public func rosettaFallbackPlatform(for requested: Platform, imageManifests: [De
     return Platform(arch: "amd64", os: requested.os, variant: nil)
 }
 
+/// The platform to run a local image with no arm64 or amd64 manifest when no platform was
+/// requested: its only linux manifest, when that architecture runs under QEMU (`QEMURuntime`).
+/// Returns nil when the image has an amd64 manifest (Rosetta is preferred) or is ambiguous.
+public func qemuFallbackPlatform(for requested: Platform, imageManifests: [Descriptor]?) -> Platform? {
+    let platforms = (imageManifests ?? []).compactMap { descriptor -> Platform? in
+        guard descriptor.annotations?["vnd.docker.reference.type"] != "attestation-manifest",
+            let platform = descriptor.platform, platform.os == requested.os
+        else { return nil }
+        return platform
+    }
+    guard !platforms.contains(where: { $0.architecture == "amd64" }), platforms.count == 1, let only = platforms.first,
+        QEMURuntime.handler(for: only.architecture) != nil
+    else { return nil }
+    return only
+}
+
 public func requestedOrDefaultPlatform(_ requestedPlatform: Platform?) -> Platform {
     requestedPlatform ?? Platform.current
 }

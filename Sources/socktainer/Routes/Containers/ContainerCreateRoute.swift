@@ -187,8 +187,14 @@ extension ContainerCreateRoute {
                 // Prefer the cached image's own amd64 manifest (it may carry a variant); a
                 // pull or multi-variant image falls back to plain linux/amd64.
                 let localManifests = try? await ClientImage.get(reference: imageReference, containerSystemConfig: systemConfig).index().manifests
-                let amd64 = rosettaFallbackPlatform(for: requestedPlatform, imageManifests: localManifests)
-                req.logger.info("\(body.Image) has no arm64 variant — falling back to \(amd64.description) (Rosetta)")
+                // An image with only a QEMU-emulated platform (e.g. s390x) runs that platform;
+                // anything else falls back to amd64 under Rosetta.
+                let amd64 =
+                    explicitPlatform
+                    ? rosettaFallbackPlatform(for: requestedPlatform, imageManifests: localManifests)
+                    : (qemuFallbackPlatform(for: requestedPlatform, imageManifests: localManifests)
+                        ?? rosettaFallbackPlatform(for: requestedPlatform, imageManifests: localManifests))
+                req.logger.info("\(body.Image) has no arm64 variant — falling back to \(amd64.description)")
                 img = try await ClientImage.fetch(
                     reference: imageReference,
                     platform: amd64,
@@ -753,6 +759,12 @@ extension ContainerCreateRoute {
                 containerConfiguration.labels[ContainerStdinRegistry.openStdinLabel] = body.OpenStdin == true ? "true" : nil
 
                 containerConfiguration.mounts = resolvedMounts
+                // Foreign architectures (s390x, ppc64le, riscv64) run under QEMU: the init
+                // process registers binfmt_misc in the container's own VM, then execs the command.
+                if let qemuHandler = QEMURuntime.handler(for: requestedPlatform) {
+                    let assets = try await QEMURuntime.ensureAssets(handler: qemuHandler, containerSystemConfig: systemConfig, logger: req.logger)
+                    QEMURuntime.apply(to: &containerConfiguration, handler: qemuHandler, assetDirectory: assets)
+                }
                 // Always overwrite client-supplied metadata, including an empty list.
                 containerConfiguration.labels[ContainerAnonymousVolumes.label] =
                     try ContainerAnonymousVolumes.encode(createdAnonymousVolumes)
