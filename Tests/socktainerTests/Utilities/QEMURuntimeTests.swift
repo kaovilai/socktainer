@@ -43,8 +43,8 @@ struct QEMURuntimeTests {
 
     @Test("each magic and mask is 20 escaped bytes")
     func magicAndMaskLengths() throws {
-        for arch in ["s390x", "ppc64le", "riscv64"] {
-            let handler = try #require(QEMURuntime.handler(for: arch))
+        for handler in QEMURuntime.allHandlers {
+            let arch = handler.qemuArch
             // "\x7fELF" counts as 4 bytes in 7 characters.
             let magicBytes = handler.magic.replacingOccurrences(of: "ELF", with: #"\x00\x00\x00"#).components(separatedBy: #"\x"#).count - 1
             let maskBytes = handler.mask.components(separatedBy: #"\x"#).count - 1
@@ -106,13 +106,13 @@ struct QEMURuntimeTests {
     @Test("best-effort wrapper for privileged containers registers every handler without exiting")
     func bestEffortAllHandlers() {
         let script = QEMURuntime.wrapperScript(handlers: QEMURuntime.allHandlers, user: .id(uid: 0, gid: 0), required: false)
-        for arch in ["s390x", "ppc64le", "riscv64"] {
+        for arch in ["x86_64", "s390x", "ppc64le", "riscv64"] {
             #expect(script.contains(":qemu-\(arch):M::"))
         }
         #expect(!script.contains("exit 126"))
         var cfg = config(process())
         QEMURuntime.apply(to: &cfg, handlers: QEMURuntime.allHandlers, assetDirectory: URL(fileURLWithPath: "/tmp/q"), required: false)
-        #expect(cfg.labels[QEMURuntime.label] == "s390x,ppc64le,riscv64")
+        #expect(cfg.labels[QEMURuntime.label] == "x86_64,s390x,ppc64le,riscv64")
     }
 
     @Test("only privileged arm64 linux containers emulate foreign platforms")

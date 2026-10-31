@@ -765,11 +765,10 @@ extension ContainerCreateRoute {
                     let assets = try await QEMURuntime.ensureAssets(handlers: [qemuHandler], containerSystemConfig: systemConfig, logger: req.logger)
                     QEMURuntime.apply(to: &containerConfiguration, handlers: [qemuHandler], assetDirectory: assets)
                 } else if ContainerCreateRoute.emulatesForeignPlatforms(hostConfig: body.HostConfig, platform: requestedPlatform) {
-                    // Like Docker Desktop, a privileged arm64 container can run amd64 binaries
-                    // (Rosetta) and s390x/ppc64le/riscv64 ones (QEMU), so emulators inside it
-                    // work: buildx's docker-container driver detects these as build platforms.
+                    // Like Docker Desktop, a privileged arm64 container can run amd64, s390x,
+                    // ppc64le and riscv64 binaries (QEMU), so emulators inside it work:
+                    // buildx's docker-container driver detects these as build platforms.
                     // Best-effort: without the assets the container still runs natively.
-                    containerConfiguration.rosetta = true
                     do {
                         let handlers = QEMURuntime.allHandlers
                         let assets = try await QEMURuntime.ensureAssets(handlers: handlers, containerSystemConfig: systemConfig, logger: req.logger)

@@ -73,6 +73,14 @@ enum QEMURuntime {
         }
     }
 
+    /// amd64 under QEMU, for privileged containers only: amd64 containers themselves run
+    /// under Rosetta, but Apple registers Rosetta's handler without exposing /run/rosetta
+    /// inside an arm64 container, and buildkitd's platform probe does not detect it there.
+    static let amd64Handler = Handler(
+        qemuArch: "x86_64",
+        magic: #"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00"#,
+        mask: #"\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff"#)
+
     /// Whether `platform` needs QEMU on this host: a known foreign architecture on an arm64 host.
     static func handler(for platform: Platform, host: Platform = .current) -> Handler? {
         guard host.architecture == "arm64", platform.os == "linux" else { return nil }
@@ -81,7 +89,7 @@ enum QEMURuntime {
 
     /// Every handler, registered in privileged containers so emulators running inside them
     /// (buildx's buildkitd) can execute foreign binaries, as on Docker Desktop.
-    static var allHandlers: [Handler] { ["s390x", "ppc64le", "riscv64"].compactMap { handler(for: $0) } }
+    static var allHandlers: [Handler] { [amd64Handler] + ["s390x", "ppc64le", "riscv64"].compactMap { handler(for: $0) } }
 
     /// The shell script the wrapper runs with `busybox sh -c`. `$@` is the original command.
     /// A non-root user is switched to with busybox `chpst` after registration. When
