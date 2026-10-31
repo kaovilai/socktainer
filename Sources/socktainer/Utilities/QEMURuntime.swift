@@ -175,15 +175,14 @@ enum QEMURuntime {
         defer { try? FileManager.default.removeItem(at: scratch) }
         for layer in manifest.layers.reversed() {
             guard let content = try await RemoteContentStoreClient().get(digest: layer.digest) else { continue }
-            let tar = Process()
-            tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-            tar.arguments = ["-xf", content.path.path, "-C", scratch.path, member]
-            tar.standardOutput = FileHandle.nullDevice
-            tar.standardError = FileHandle.nullDevice
-            try tar.run()
-            tar.waitUntilExit()
             let extracted = scratch.appendingPathComponent(member)
-            guard tar.terminationStatus == 0, FileManager.default.fileExists(atPath: extracted.path) else { continue }
+            // busybox images store bin/busybox as a hard link to another applet, which tar
+            // cannot extract alone; fall back to the whole layer.
+            try untar(content.path, into: scratch, members: [member])
+            if !FileManager.default.fileExists(atPath: extracted.path) {
+                try untar(content.path, into: scratch, members: [])
+            }
+            guard FileManager.default.fileExists(atPath: extracted.path) else { continue }
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: extracted.path)
             // Rename into place so a concurrent create never sees a partial binary.
             let staged = destination.deletingLastPathComponent().appendingPathComponent(".\(destination.lastPathComponent).\(UUID().uuidString)")
@@ -195,5 +194,15 @@ enum QEMURuntime {
             return
         }
         throw ContainerizationError(.notFound, message: "\(member) not found in \(reference)")
+    }
+
+    private static func untar(_ archive: URL, into directory: URL, members: [String]) throws {
+        let tar = Process()
+        tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        tar.arguments = ["-xf", archive.path, "-C", directory.path] + members
+        tar.standardOutput = FileHandle.nullDevice
+        tar.standardError = FileHandle.nullDevice
+        try tar.run()
+        tar.waitUntilExit()
     }
 }
