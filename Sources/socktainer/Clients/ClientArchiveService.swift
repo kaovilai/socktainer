@@ -581,20 +581,16 @@ struct ClientArchiveService: ClientArchiveProtocol {
     /// Only regular files: a directory would need a whole-directory mount,
     /// which hides what the image put there, and a symlink has no mount that
     /// reproduces it. Both are refused while the copy can still be retried
-    /// after start.
+    /// after start. A directory entry that only holds files from the same
+    /// archive is fine: each file's mount creates its parents. buildx's
+    /// docker-container driver sends exactly that (`buildkit/` and
+    /// `buildkit/buildkitd.toml` into /etc) before starting buildkitd.
     private func stagePreStartInjection(
         container: ContainerSnapshot, destinationPath: String, tarPath: URL
     ) async throws {
         let plan = try parseArchiveEntries(tarPath: tarPath, destinationPath: destinationPath)
-        for entry in plan {
-            if case .symlink = entry.kind {
-                throw ClientArchiveError.operationFailed(
-                    message: "cannot copy a symlink into \(container.id) before it starts")
-            }
-            if case .directory = entry.kind {
-                throw ClientArchiveError.operationFailed(
-                    message: "cannot copy a directory into \(container.id) before it starts")
-            }
+        if let refusal = Self.preStartRefusal(plan: plan, containerId: container.id) {
+            throw ClientArchiveError.operationFailed(message: refusal)
         }
 
         // An empty tar carries nothing to stage, and `ArchiveReader.extractContents`
@@ -621,6 +617,37 @@ struct ClientArchiveService: ClientArchiveProtocol {
                 containerId: container.id, guestPath: entry.guestPath,
                 source: extracted, mode: entry.mode)
         }
+    }
+
+    /// Why an archive cannot be staged before the container starts, or nil when every
+    /// entry is a regular file or a directory that is a parent of one of its files.
+    static func preStartRefusal(plan: [ArchiveEntryPlan], containerId: String) -> String? {
+        let fileParents = Set(
+            plan.flatMap { entry -> [String] in
+                guard case .file = entry.kind else { return [] }
+                var parents: [String] = []
+                var path = (entry.guestPath as NSString).deletingLastPathComponent
+                while !path.isEmpty {
+                    parents.append(path)
+                    if path == "/" { break }
+                    path = (path as NSString).deletingLastPathComponent
+                }
+                return parents
+            })
+        for entry in plan {
+            switch entry.kind {
+            case .symlink:
+                return "cannot copy a symlink into \(containerId) before it starts"
+            case .directory:
+                let path = entry.guestPath.count > 1 && entry.guestPath.hasSuffix("/") ? String(entry.guestPath.dropLast()) : entry.guestPath
+                if !fileParents.contains(path) {
+                    return "cannot copy a directory into \(containerId) before it starts"
+                }
+            case .file:
+                continue
+            }
+        }
+        return nil
     }
 
     /// One parsed entry of the uploaded archive.
